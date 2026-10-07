@@ -38,6 +38,7 @@ namespace PlayTimer
             this.resetHour = resetHour;
 
             Text = "PlayTimer 시간 설정";
+            if (Ui.AppIcon != null) Icon = Ui.AppIcon; else ShowIcon = false;
             FormBorderStyle = FormBorderStyle.FixedSingle;
             MaximizeBox = false;
             StartPosition = FormStartPosition.CenterScreen;

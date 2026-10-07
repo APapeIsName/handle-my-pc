@@ -32,8 +32,11 @@ namespace PlayTimer
 
         const string FontName = "Malgun Gothic";
 
+        public static Icon AppIcon;
+
         public static void Init()
         {
+            try { AppIcon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
             try
             {
                 using (var g = Graphics.FromHwnd(IntPtr.Zero)) Scale = g.DpiX / 96f;

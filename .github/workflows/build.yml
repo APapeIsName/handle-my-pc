@@ -1,0 +1,43 @@
+name: Build
+
+# 모든 push 에서 윈도우 기본 컴파일러로 빌드를 확인하고,
+# v* 태그를 push 하면 PlayTimer.zip 을 GitHub Release 로 올린다.
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build PlayTimer.exe
+        shell: cmd
+        run: call build.bat
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $out = 'dist/PlayTimer'
+          New-Item -ItemType Directory -Path $out -Force | Out-Null
+          Copy-Item PlayTimer.exe, config.ini, install.bat, install.ps1, uninstall.bat, uninstall.ps1, README.md $out
+          Compress-Archive -Path "$out/*" -DestinationPath dist/PlayTimer.zip -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PlayTimer
+          path: dist/PlayTimer
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/PlayTimer.zip
+          generate_release_notes: true
