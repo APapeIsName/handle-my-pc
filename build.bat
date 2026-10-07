@@ -7,7 +7,7 @@ if not exist "%CSC%" (
   echo csc.exe를 찾을 수 없습니다. .NET Framework 4.x가 필요합니다.
   exit /b 1
 )
-"%CSC%" /nologo /target:winexe /optimize+ /codepage:65001 /r:System.Windows.Forms.dll /r:System.Drawing.dll /out:"%~dp0PlayTimer.exe" "%~dp0src\PlayTimer.cs"
+"%CSC%" /nologo /target:winexe /optimize+ /codepage:65001 /r:System.Windows.Forms.dll /r:System.Drawing.dll /out:"%~dp0PlayTimer.exe" "%~dp0src\*.cs"
 if errorlevel 1 (
   echo 빌드 실패
   exit /b 1

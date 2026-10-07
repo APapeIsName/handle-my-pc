@@ -104,6 +104,8 @@ namespace PlayTimer
         public string Day = "";
         public double UsedSeconds;
         public int ExtensionsUsed;
+        // 시간대 밖이어도 연장으로 허용된 시각(UTC ticks)
+        public long GraceUntilUtcTicks;
 
         public static State Load(string path)
         {
@@ -118,6 +120,7 @@ namespace PlayTimer
                 if (key == "day") s.Day = val;
                 else if (key == "used") double.TryParse(val, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out s.UsedSeconds);
                 else if (key == "ext") int.TryParse(val, out s.ExtensionsUsed);
+                else if (key == "grace") long.TryParse(val, out s.GraceUntilUtcTicks);
             }
             return s;
         }
@@ -129,7 +132,8 @@ namespace PlayTimer
             File.WriteAllLines(tmp, new string[] {
                 "day=" + Day,
                 "used=" + UsedSeconds.ToString(System.Globalization.CultureInfo.InvariantCulture),
-                "ext=" + ExtensionsUsed
+                "ext=" + ExtensionsUsed,
+                "grace=" + GraceUntilUtcTicks
             });
             if (File.Exists(path)) File.Delete(path);
             File.Move(tmp, path);
@@ -143,7 +147,12 @@ namespace PlayTimer
 
         readonly Config config;
         readonly string statePath;
+        readonly string schedulePath;
         State state;
+        Schedule schedule;
+        ScheduleForm scheduleForm;
+        double outsideSeconds;
+        double prevRemaining = double.NaN;
         readonly NotifyIcon tray;
         readonly System.Windows.Forms.Timer tick;
         readonly ToolStripMenuItem statusItem;
@@ -165,6 +174,8 @@ namespace PlayTimer
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
                 "PlayTimer", "state.txt");
             state = State.Load(statePath);
+            schedulePath = Path.Combine(Path.GetDirectoryName(statePath), "schedule.txt");
+            schedule = Schedule.Load(schedulePath, config.DailyLimitMinutes);
             RollDayIfNeeded();
 
             statusItem = new ToolStripMenuItem("") { Enabled = false };
@@ -172,6 +183,7 @@ namespace PlayTimer
             var menu = new ContextMenuStrip();
             menu.Items.Add(statusItem);
             menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add(new ToolStripMenuItem("시간 설정...", null, delegate { OpenSchedule(); }) { Font = new Font(menu.Font, FontStyle.Bold) });
             menu.Items.Add(extendItem);
             menu.Items.Add(new ToolStripMenuItem("PC 끄기", null, delegate { ConfirmShutdown(null); }));
             menu.Items.Add(new ToolStripSeparator());
@@ -179,7 +191,7 @@ namespace PlayTimer
             menu.Opening += delegate { UpdateMenu(); };
 
             tray = new NotifyIcon { ContextMenuStrip = menu, Visible = true };
-            tray.DoubleClick += delegate { ShowStatus(); };
+            tray.DoubleClick += delegate { OpenSchedule(); };
 
             SystemEvents.SessionSwitch += OnSessionSwitch;
 
@@ -192,7 +204,7 @@ namespace PlayTimer
             if (remaining <= 0)
                 lastNagClosed = DateTime.UtcNow.AddSeconds(-config.Stage1NagSeconds + 5);
             else
-                Toast.Show(string.Format("오늘 남은 시간: {0}", FormatTime(remaining)), false);
+                Toast.Show(string.Format("남은 시간: {0}", FormatTime(remaining)), false);
         }
 
         void OnSessionSwitch(object sender, SessionSwitchEventArgs e)
@@ -213,19 +225,51 @@ namespace PlayTimer
             string today = TodayKey();
             if (state.Day != today)
             {
-                state = new State { Day = today };
+                state = new State { Day = today, GraceUntilUtcTicks = state.GraceUntilUtcTicks };
                 SaveState();
             }
         }
 
-        double LimitSeconds()
+        DateTime Logical()
         {
-            return (config.DailyLimitMinutes + state.ExtensionsUsed * config.ExtensionMinutes) * 60.0;
+            return DateTime.Now.AddHours(-config.ResetHour);
         }
 
-        double RemainingSeconds()
+        double LimitSeconds()
+        {
+            int today = (int)Logical().DayOfWeek;
+            return (schedule.LimitMinutes[today] + state.ExtensionsUsed * config.ExtensionMinutes) * 60.0;
+        }
+
+        // 하루 총량 기준 남은 시간
+        double QuotaRemaining()
         {
             return LimitSeconds() - state.UsedSeconds;
+        }
+
+        double GraceRemaining()
+        {
+            return (new DateTime(state.GraceUntilUtcTicks, DateTimeKind.Utc) - DateTime.UtcNow).TotalSeconds;
+        }
+
+        // 허용 시간대 기준 남은 시간. 시간대 밖이면 밖에서 쓴 시간만큼 음수.
+        double WindowRemaining()
+        {
+            double w = schedule.SecondsUntilWindowEnd(Logical());
+            double g = GraceRemaining();
+            if (w > 0 || g > 0) return Math.Max(w, g);
+            return -outsideSeconds;
+        }
+
+        // 총량과 시간대 중 먼저 끝나는 쪽
+        double RemainingSeconds()
+        {
+            return Math.Min(QuotaRemaining(), WindowRemaining());
+        }
+
+        public string NagReason()
+        {
+            return QuotaRemaining() <= 0 ? "오늘 사용 시간이 끝났습니다" : "지금은 쓰기로 한 시간대가 아닙니다";
         }
 
         void OnTick()
@@ -239,15 +283,25 @@ namespace PlayTimer
             RollDayIfNeeded();
             if (locked) return;
 
-            double before = RemainingSeconds();
             state.UsedSeconds += delta;
-            double after = RemainingSeconds();
+            if (schedule.IsAllowed(Logical()) || GraceRemaining() > 0) outsideSeconds = 0;
+            else outsideSeconds += delta;
 
+            double before = double.IsNaN(prevRemaining) ? double.MaxValue : prevRemaining;
+            double after = RemainingSeconds();
+            prevRemaining = after;
+
+            // 여러 경고 지점을 한꺼번에 지나면 가장 급한 것 하나만 보여 준다.
+            int crossed = int.MaxValue;
             foreach (int w in config.WarnAtMinutes)
             {
                 double t = w * 60.0;
-                if (before > t && after <= t)
-                    Toast.Show(string.Format("{0}분 남았습니다. 슬슬 정리하세요.", w), w <= 1);
+                if (before > t && after <= t && after > 0) crossed = Math.Min(crossed, w);
+            }
+            if (crossed != int.MaxValue)
+            {
+                string why = QuotaRemaining() <= WindowRemaining() ? "오늘 사용 시간" : "허용 시간대";
+                Toast.Show(string.Format("{0}이 {1}분 남았습니다. 슬슬 정리하세요.", why, crossed), crossed <= 1);
             }
             if (before > 0 && after <= 0)
                 lastNagClosed = DateTime.MinValue;
@@ -310,10 +364,18 @@ namespace PlayTimer
                 "PlayTimer", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2);
             if (r != DialogResult.Yes) return false;
 
-            // 이미 초과한 시간은 연장분에서 깎이지 않도록, 초과분을 사용 시간에서 털어 낸다.
-            double over = -RemainingSeconds();
-            if (over > 0) state.UsedSeconds -= over;
+            // 이미 초과한 시간은 연장분에서 깎이지 않도록, 초과분을 털어 낸다.
+            double quotaOver = -QuotaRemaining();
+            if (quotaOver > 0) state.UsedSeconds -= quotaOver;
             state.ExtensionsUsed++;
+            double window = WindowRemaining();
+            if (window <= QuotaRemaining())
+            {
+                // 시간대가 먼저 끝나는(또는 이미 밖인) 상황이면 시간대도 연장한다.
+                state.GraceUntilUtcTicks = DateTime.UtcNow.AddSeconds(Math.Max(0, window) + config.ExtensionMinutes * 60.0).Ticks;
+                outsideSeconds = 0;
+            }
+            prevRemaining = RemainingSeconds();
             SaveState();
             UpdateTray();
             if (activeNag != null) activeNag.Close();
@@ -360,19 +422,35 @@ namespace PlayTimer
             try { state.Save(statePath); } catch { }
         }
 
-        void ShowStatus()
+        void OpenSchedule()
         {
-            double rem = RemainingSeconds();
-            string msg = rem > 0
-                ? string.Format("오늘 남은 시간: {0}\n사용한 시간: {1}", FormatTime(rem), FormatTime(state.UsedSeconds))
-                : string.Format("시간 초과: {0}\n사용한 시간: {1}", FormatTime(-rem), FormatTime(state.UsedSeconds));
-            MessageBox.Show(msg, "PlayTimer");
+            if (scheduleForm != null)
+            {
+                scheduleForm.Activate();
+                return;
+            }
+            scheduleForm = new ScheduleForm(schedule, config.ResetHour);
+            scheduleForm.FormClosed += delegate
+            {
+                if (scheduleForm.DialogResult == DialogResult.OK)
+                {
+                    schedule = scheduleForm.Result;
+                    try { schedule.Save(schedulePath); }
+                    catch (Exception ex) { MessageBox.Show("시간표 저장 실패: " + ex.Message, "PlayTimer"); }
+                    lastIconText = null;
+                    UpdateTray();
+                }
+                scheduleForm.Dispose();
+                scheduleForm = null;
+            };
+            scheduleForm.Show();
         }
 
         void UpdateMenu()
         {
             double rem = RemainingSeconds();
-            statusItem.Text = rem > 0 ? "남은 시간 " + FormatTime(rem) : "시간 초과 " + FormatTime(-rem);
+            statusItem.Text = string.Format("{0}  (오늘 {1} 사용)",
+                rem > 0 ? "남은 시간 " + FormatTime(rem) : "초과 " + FormatTime(-rem), FormatTime(state.UsedSeconds));
             extendItem.Text = ExtendLabel();
             extendItem.Enabled = CanExtend();
         }
@@ -474,11 +552,13 @@ namespace PlayTimer
         readonly Label overLabel;
         readonly Button closeButton;
         readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
+        readonly int stage;
         int closeDelay;
 
         public NagForm(TrayApp app, int stage, int closeDelaySeconds)
         {
             this.app = app;
+            this.stage = stage;
             closeDelay = closeDelaySeconds;
 
             Text = "PlayTimer";
@@ -494,7 +574,7 @@ namespace PlayTimer
 
             var title = new Label
             {
-                Text = stage == 2 ? "진짜로 이제 그만할 시간입니다" : "오늘 사용 시간이 끝났습니다",
+                Text = stage == 2 ? "진짜로 이제 그만할 시간입니다" : app.NagReason(),
                 ForeColor = Color.White,
                 Font = new Font("맑은 고딕", stage == 2 ? 20f : 15f, FontStyle.Bold),
                 AutoSize = false,
@@ -558,7 +638,9 @@ namespace PlayTimer
 
         void Refresh2()
         {
-            overLabel.Text = "초과 시간: " + app.OvertimeText();
+            overLabel.Text = stage == 2
+                ? app.NagReason() + " (초과 " + app.OvertimeText() + ")"
+                : "초과 시간: " + app.OvertimeText();
             if (closeDelay > 0)
             {
                 closeButton.Enabled = false;
@@ -611,7 +693,7 @@ namespace PlayTimer
 
             var title = new Label
             {
-                Text = "그만!\n오늘 사용 시간이 한참 지났습니다.",
+                Text = "그만!\n" + app.NagReason() + ".",
                 ForeColor = Color.White,
                 Font = new Font("맑은 고딕", 36f, FontStyle.Bold),
                 AutoSize = true,
