@@ -435,7 +435,8 @@ namespace PlayTimer
             var settings = new UiButton("시간 설정", ButtonKind.Primary, false);
             settings.Click += delegate { Close(); app.OpenSchedule(); };
             extendButton = new UiButton("연장", ButtonKind.Secondary, false);
-            extendButton.Click += delegate { app.RequestExtend(this); };
+            // 확인 창이 뜨면 이 카드는 포커스를 잃어 닫히므로, 먼저 닫고 묻는다.
+            extendButton.Click += delegate { Close(); app.RequestExtend(null); };
             var shutdown = new UiButton("PC 끄기", ButtonKind.Ghost, false);
             shutdown.Click += delegate { Close(); app.RequestShutdown(null); };
             row.Controls.Add(settings);

@@ -151,6 +151,9 @@ namespace PlayTimer
         [DllImport("user32.dll")]
         static extern bool DestroyIcon(IntPtr handle);
 
+        [DllImport("user32.dll")]
+        static extern bool SetForegroundWindow(IntPtr hWnd);
+
         readonly Config config;
         readonly string statePath;
         readonly string schedulePath;
@@ -552,7 +555,7 @@ namespace PlayTimer
                 UpdateTray();
                 Toast.Show("시간표를 저장했어요", WindowLineShort(), Ui.Blue);
             };
-            scheduleForm.FormClosed += delegate { scheduleForm.Dispose(); scheduleForm = null; };
+            scheduleForm.FormClosed += delegate { scheduleForm = null; };
             scheduleForm.Show();
             scheduleForm.Activate();
         }
@@ -565,6 +568,8 @@ namespace PlayTimer
             flyout = new StatusFlyout(this);
             flyout.FormClosed += delegate { flyout = null; flyoutClosedAt = DateTime.UtcNow; };
             flyout.Show();
+            // 트레이에서 띄운 창은 포커스를 못 받는 경우가 있어, 그러면 바깥을 눌러도 닫히지 않는다.
+            try { SetForegroundWindow(flyout.Handle); } catch { }
             flyout.Activate();
         }
 
