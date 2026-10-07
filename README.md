@@ -152,4 +152,5 @@ install.ps1        설치 스크립트 (install.bat이 호출)
 ```
 
 - `build.bat`을 실행하면 `PlayTimer.exe`가 만들어져요.
-- GitHub Actions가 push마다 윈도우에서 빌드를 확인해요. `v*` 태그를 push하면 `PlayTimer.zip`이 Releases에 올라가요.
+- GitHub Actions가 push마다 윈도우에서 빌드를 확인해요.
+- 새 버전을 내려면 `src/AssemblyInfo.cs`의 버전을 올려서 기본 브랜치에 push하세요. 그 버전의 릴리스가 없으면 `PlayTimer.zip`이 담긴 Release가 자동으로 만들어져요.
