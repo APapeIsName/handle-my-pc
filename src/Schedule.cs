@@ -83,6 +83,13 @@ namespace PlayTimer
             File.Move(tmp, path);
         }
 
+        public bool AlwaysAllowed()
+        {
+            for (int d = 0; d < 7; d++)
+                foreach (bool b in Allowed[d]) if (!b) return false;
+            return true;
+        }
+
         public int AllowedMinutes(int day)
         {
             int n = 0;
@@ -95,6 +102,37 @@ namespace PlayTimer
         {
             int slot = (int)(logical.TimeOfDay.TotalMinutes / SlotMinutes);
             return Allowed[(int)logical.DayOfWeek][slot];
+        }
+
+        static DateTime SlotStart(DateTime logical)
+        {
+            return logical.Date.AddMinutes((int)(logical.TimeOfDay.TotalMinutes / SlotMinutes) * SlotMinutes);
+        }
+
+        // 지금 들어 있는 허용 시간대의 시작과 끝(논리적 시각). 최대 7일까지만 본다.
+        public bool CurrentWindow(DateTime logical, out DateTime start, out DateTime end)
+        {
+            start = end = logical;
+            if (!IsAllowed(logical)) return false;
+            DateTime s = SlotStart(logical);
+            DateTime cap = logical.AddDays(-7);
+            while (s > cap && IsAllowed(s.AddMinutes(-SlotMinutes))) s = s.AddMinutes(-SlotMinutes);
+            start = s;
+            end = logical.AddSeconds(SecondsUntilWindowEnd(logical));
+            return true;
+        }
+
+        // 다음 허용 시간대가 시작하는 논리적 시각. 일주일 안에 없으면 null.
+        public DateTime? NextWindowStart(DateTime logical)
+        {
+            DateTime t = SlotStart(logical).AddMinutes(SlotMinutes);
+            DateTime cap = logical.AddDays(7);
+            while (t < cap)
+            {
+                if (IsAllowed(t)) return t;
+                t = t.AddMinutes(SlotMinutes);
+            }
+            return null;
         }
 
         // 지금 허용 시간대 안이라면, 그 시간대가 끝날 때까지 남은 초. 밖이면 0.

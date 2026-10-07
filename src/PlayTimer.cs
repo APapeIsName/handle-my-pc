@@ -4,6 +4,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
+using System.Drawing.Drawing2D;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -14,6 +15,8 @@ namespace PlayTimer
 {
     static class Program
     {
+        public const string ShowEventName = "PlayTimer_ShowSettings";
+
         [DllImport("user32.dll")]
         static extern bool SetProcessDPIAware();
 
@@ -25,10 +28,12 @@ namespace PlayTimer
             {
                 if (!createdNew)
                 {
-                    MessageBox.Show("PlayTimer가 이미 실행 중입니다.", "PlayTimer");
+                    // 이미 실행 중이면 실행 중인 쪽에 "설정 창 열어"라고 알리고 끝낸다.
+                    try { EventWaitHandle.OpenExisting(ShowEventName).Set(); } catch { }
                     return;
                 }
                 try { SetProcessDPIAware(); } catch { }
+                Ui.Init();
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
                 Application.Run(new TrayApp());
@@ -140,6 +145,7 @@ namespace PlayTimer
         }
     }
 
+
     class TrayApp : ApplicationContext
     {
         [DllImport("user32.dll")]
@@ -150,48 +156,65 @@ namespace PlayTimer
         readonly string schedulePath;
         State state;
         Schedule schedule;
-        ScheduleForm scheduleForm;
-        double outsideSeconds;
-        double prevRemaining = double.NaN;
         readonly NotifyIcon tray;
         readonly System.Windows.Forms.Timer tick;
-        readonly ToolStripMenuItem statusItem;
+        readonly ToolStripLabel menuHeader, menuSub;
         readonly ToolStripMenuItem extendItem;
+        readonly EventWaitHandle showEvent;
+        readonly SynchronizationContext ui;
 
         DateTime lastTick = DateTime.UtcNow;
         DateTime lastSave = DateTime.UtcNow;
         DateTime lastNagClosed = DateTime.MinValue;
+        DateTime flyoutClosedAt = DateTime.MinValue;
+        double outsideSeconds;
+        double prevRemaining = double.NaN;
         bool locked;
+        bool shuttingDown;
         Form activeNag;
-        string lastIconText;
+        int activeStage;
+        StatusFlyout flyout;
+        ScheduleForm scheduleForm;
+        ShutdownNotice shutdownNotice;
+        string lastIconKey;
         IntPtr lastIconHandle = IntPtr.Zero;
+
+        // 코드에서 조르기 창을 닫을 때는 "아직 못 닫음" 잠금을 무시한다.
+        public bool ClosingByApp { get; private set; }
 
         public TrayApp()
         {
             string exeDir = Path.GetDirectoryName(Application.ExecutablePath);
             config = Config.Load(Path.Combine(exeDir, "config.ini"));
-            statePath = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "PlayTimer", "state.txt");
+            string dataDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "PlayTimer");
+            statePath = Path.Combine(dataDir, "state.txt");
+            schedulePath = Path.Combine(dataDir, "schedule.txt");
+            bool firstRun = !File.Exists(schedulePath);
             state = State.Load(statePath);
-            schedulePath = Path.Combine(Path.GetDirectoryName(statePath), "schedule.txt");
             schedule = Schedule.Load(schedulePath, config.DailyLimitMinutes);
             RollDayIfNeeded();
 
-            statusItem = new ToolStripMenuItem("") { Enabled = false };
-            extendItem = new ToolStripMenuItem("", null, delegate { TryExtend(null); });
-            var menu = new ContextMenuStrip();
-            menu.Items.Add(statusItem);
+            menuHeader = new ToolStripLabel { Font = Ui.Font(11f, FontStyle.Bold), Margin = Ui.Pad(4, 6, 4, 0) };
+            menuSub = new ToolStripLabel { ForeColor = Ui.SubText, Margin = Ui.Pad(4, 0, 4, 6) };
+            extendItem = new ToolStripMenuItem("", null, delegate { RequestExtend(null); });
+            var menu = new ContextMenuStrip { Font = Ui.Font(9.5f), ShowImageMargin = false };
+            menu.Items.Add(menuHeader);
+            menu.Items.Add(menuSub);
             menu.Items.Add(new ToolStripSeparator());
-            menu.Items.Add(new ToolStripMenuItem("시간 설정...", null, delegate { OpenSchedule(); }) { Font = new Font(menu.Font, FontStyle.Bold) });
+            menu.Items.Add(new ToolStripMenuItem("시간 설정...", null, delegate { OpenSchedule(); }) { Font = Ui.Font(9.5f, FontStyle.Bold) });
             menu.Items.Add(extendItem);
-            menu.Items.Add(new ToolStripMenuItem("PC 끄기", null, delegate { ConfirmShutdown(null); }));
             menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add(new ToolStripMenuItem("PC 끄기", null, delegate { RequestShutdown(null); }));
             menu.Items.Add(new ToolStripMenuItem("타이머 종료", null, delegate { ConfirmExit(); }));
             menu.Opening += delegate { UpdateMenu(); };
 
             tray = new NotifyIcon { ContextMenuStrip = menu, Visible = true };
-            tray.DoubleClick += delegate { OpenSchedule(); };
+            tray.MouseClick += delegate(object s, MouseEventArgs e) { if (e.Button == MouseButtons.Left) ToggleFlyout(); };
+            tray.MouseDoubleClick += delegate(object s, MouseEventArgs e) { if (e.Button == MouseButtons.Left) OpenSchedule(); };
+
+            ui = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
+            showEvent = new EventWaitHandle(false, EventResetMode.AutoReset, Program.ShowEventName);
+            ThreadPool.RegisterWaitForSingleObject(showEvent, delegate { ui.Post(delegate { OpenSchedule(); }, null); }, null, -1, false);
 
             SystemEvents.SessionSwitch += OnSessionSwitch;
 
@@ -200,11 +223,15 @@ namespace PlayTimer
             tick.Start();
 
             UpdateTray();
-            double remaining = RemainingSeconds();
-            if (remaining <= 0)
-                lastNagClosed = DateTime.UtcNow.AddSeconds(-config.Stage1NagSeconds + 5);
-            else
-                Toast.Show(string.Format("남은 시간: {0}", FormatTime(remaining)), false);
+            if (firstRun)
+            {
+                Toast.Show("PlayTimer를 시작했어요", "요일별 사용 시간과 시간대를 정해 주세요. 트레이 아이콘을 클릭하면 언제든 현황을 볼 수 있어요.", Ui.Blue);
+                OpenSchedule();
+            }
+            else if (RemainingSeconds() > 0)
+            {
+                Toast.Show("남은 시간 " + Ui.Clock(RemainingSeconds()), WindowLineShort(), Ui.Blue);
+            }
         }
 
         void OnSessionSwitch(object sender, SessionSwitchEventArgs e)
@@ -215,24 +242,21 @@ namespace PlayTimer
                 locked = false;
         }
 
-        string TodayKey()
+        // ── 시간 계산 ─────────────────────────────────────────────
+
+        DateTime Logical()
         {
-            return DateTime.Now.AddHours(-config.ResetHour).ToString("yyyy-MM-dd");
+            return DateTime.Now.AddHours(-config.ResetHour);
         }
 
         void RollDayIfNeeded()
         {
-            string today = TodayKey();
+            string today = Logical().ToString("yyyy-MM-dd");
             if (state.Day != today)
             {
                 state = new State { Day = today, GraceUntilUtcTicks = state.GraceUntilUtcTicks };
                 SaveState();
             }
-        }
-
-        DateTime Logical()
-        {
-            return DateTime.Now.AddHours(-config.ResetHour);
         }
 
         double LimitSeconds()
@@ -241,7 +265,6 @@ namespace PlayTimer
             return (schedule.LimitMinutes[today] + state.ExtensionsUsed * config.ExtensionMinutes) * 60.0;
         }
 
-        // 하루 총량 기준 남은 시간
         double QuotaRemaining()
         {
             return LimitSeconds() - state.UsedSeconds;
@@ -267,10 +290,86 @@ namespace PlayTimer
             return Math.Min(QuotaRemaining(), WindowRemaining());
         }
 
-        public string NagReason()
+        // 논리적 시각을 사람이 읽는 시각으로: "22:00", "내일 18:00", "토요일 10:00"
+        string When(DateTime logical)
         {
-            return QuotaRemaining() <= 0 ? "오늘 사용 시간이 끝났습니다" : "지금은 쓰기로 한 시간대가 아닙니다";
+            DateTime real = logical.AddHours(config.ResetHour);
+            DateTime today = DateTime.Now.Date;
+            string hm = real.ToString("HH:mm");
+            if (real.Date == today) return hm;
+            if (real.Date == today.AddDays(1)) return "내일 " + hm;
+            return ScheduleForm.DayNames[(int)real.DayOfWeek] + "요일 " + hm;
         }
+
+        string WindowLineShort()
+        {
+            if (schedule.AlwaysAllowed()) return "시간대 제한 없이 총량만 적용돼요.";
+            var logical = Logical();
+            DateTime start, end;
+            if (GraceRemaining() > 0 && !schedule.IsAllowed(logical))
+                return "연장 중이에요. " + When(logical.AddSeconds(GraceRemaining())) + "까지";
+            if (schedule.CurrentWindow(logical, out start, out end))
+                return (end - logical).TotalDays >= 6 ? "지금 사용 가능해요." : "지금 사용 가능 · " + When(end) + "까지";
+            DateTime? next = schedule.NextWindowStart(logical);
+            return next.HasValue ? "지금은 쉬는 시간 · 다음 " + When(next.Value) : "이번 주에는 사용 가능한 시간대가 없어요.";
+        }
+
+        static string Seconds(int s)
+        {
+            return s % 60 == 0 ? (s / 60) + "분" : s + "초";
+        }
+
+        int StageFor(double overSeconds)
+        {
+            double overMin = overSeconds / 60.0;
+            return overMin >= config.Stage3AfterMinutes ? 3 : overMin >= config.Stage2AfterMinutes ? 2 : 1;
+        }
+
+        public Status GetStatus()
+        {
+            var st = new Status();
+            var logical = Logical();
+            st.Remaining = RemainingSeconds();
+            st.UsedSeconds = state.UsedSeconds;
+            st.LimitSeconds = LimitSeconds();
+            st.QuotaBinding = QuotaRemaining() <= WindowRemaining();
+            st.InWindow = schedule.IsAllowed(logical) || GraceRemaining() > 0;
+            st.WindowLine = "●  " + WindowLineShort();
+            st.DayLabel = string.Format("{0}월 {1}일 ({2})", logical.Month, logical.Day, ScheduleForm.DayNames[(int)logical.DayOfWeek]);
+            st.ExtensionsLeft = Math.Max(0, config.MaxExtensionsPerDay - state.ExtensionsUsed);
+            st.ExtensionMinutes = config.ExtensionMinutes;
+
+            if (QuotaRemaining() <= 0)
+            {
+                st.Reason = "오늘 사용 시간이 끝났어요";
+                st.ReasonDetail = "오늘 총량 " + Ui.Duration((int)(LimitSeconds() / 60)) + "을 모두 썼어요.";
+            }
+            else
+            {
+                st.Reason = "지금은 쉬는 시간이에요";
+                DateTime? next = schedule.NextWindowStart(logical);
+                st.ReasonDetail = next.HasValue ? "다음 사용 가능 시간은 " + When(next.Value) + "이에요." : "이번 주에는 남은 시간대가 없어요.";
+            }
+
+            double overMin = st.OverSeconds / 60.0;
+            switch (StageFor(st.OverSeconds))
+            {
+                case 1:
+                    st.EscalationHint = string.Format("닫으면 {0} 뒤에 다시 알려요. {1}분 뒤부터는 더 강하게 알려요.",
+                        Seconds(config.Stage1NagSeconds), (int)Math.Ceiling(config.Stage2AfterMinutes - overMin));
+                    break;
+                case 2:
+                    st.EscalationHint = string.Format("닫아도 {0} 뒤에 다시 떠요. {1}분 뒤부터는 화면 전체를 덮어요.",
+                        Seconds(config.Stage2NagSeconds), (int)Math.Ceiling(config.Stage3AfterMinutes - overMin));
+                    break;
+                default:
+                    st.EscalationHint = string.Format("닫아도 {0} 뒤에 다시 덮어요.", Seconds(config.Stage3NagSeconds));
+                    break;
+            }
+            return st;
+        }
+
+        // ── 매초 ─────────────────────────────────────────────────
 
         void OnTick()
         {
@@ -300,8 +399,10 @@ namespace PlayTimer
             }
             if (crossed != int.MaxValue)
             {
-                string why = QuotaRemaining() <= WindowRemaining() ? "오늘 사용 시간" : "허용 시간대";
-                Toast.Show(string.Format("{0}이 {1}분 남았습니다. 슬슬 정리하세요.", why, crossed), crossed <= 1);
+                string body = QuotaRemaining() <= WindowRemaining()
+                    ? "오늘 사용 시간이 곧 끝나요. 슬슬 정리하세요."
+                    : "곧 쉬는 시간이에요(" + When(Logical().AddSeconds(after)) + "부터). 슬슬 정리하세요.";
+                Toast.Show(crossed + "분 남았어요", body, crossed <= 1 ? Ui.Red : Ui.Amber);
             }
             if (before > 0 && after <= 0)
                 lastNagClosed = DateTime.MinValue;
@@ -318,51 +419,56 @@ namespace PlayTimer
 
         void MaybeNag(double overSeconds)
         {
-            if (activeNag != null) return;
-            double overMin = overSeconds / 60.0;
-            int stage = overMin >= config.Stage3AfterMinutes ? 3 : overMin >= config.Stage2AfterMinutes ? 2 : 1;
+            if (shuttingDown) return;
+            int stage = StageFor(overSeconds);
+            if (activeNag != null)
+            {
+                // 무시하고 있으면 열린 창을 다음 단계 창으로 바꾼다.
+                if (stage <= activeStage) return;
+                CloseNag();
+                lastNagClosed = DateTime.MinValue;
+            }
             int interval = stage == 3 ? config.Stage3NagSeconds : stage == 2 ? config.Stage2NagSeconds : config.Stage1NagSeconds;
             if ((DateTime.UtcNow - lastNagClosed).TotalSeconds < interval) return;
 
-            if (stage == 3)
-                activeNag = new OverlayNag(this, config.Stage3CloseDelaySeconds);
-            else
-                activeNag = new NagForm(this, stage, stage == 2 ? config.Stage2CloseDelaySeconds : 0);
-            activeNag.FormClosed += delegate
+            if (flyout != null) flyout.Close();
+            if (stage == 3) activeNag = new OverlayNag(this, config.Stage3CloseDelaySeconds);
+            else if (stage == 2) activeNag = new NagDialog(this, config.Stage2CloseDelaySeconds);
+            else activeNag = new NagCard(this);
+            activeStage = stage;
+            var shown = activeNag;
+            shown.FormClosed += delegate
             {
-                activeNag = null;
+                if (activeNag == shown) activeNag = null;
                 lastNagClosed = DateTime.UtcNow;
             };
-            activeNag.Show();
+            shown.Show();
         }
 
-        public string OvertimeText()
+        void CloseNag()
         {
-            return FormatTime(Math.Max(0, -RemainingSeconds()));
+            if (activeNag == null) return;
+            ClosingByApp = true;
+            try { activeNag.Close(); }
+            finally { ClosingByApp = false; }
+            activeNag = null;
         }
 
-        public bool CanExtend()
-        {
-            return state.ExtensionsUsed < config.MaxExtensionsPerDay && config.ExtensionMinutes > 0;
-        }
+        // ── 사용자 동작 ──────────────────────────────────────────
 
-        public string ExtendLabel()
+        public void RequestExtend(IWin32Window owner)
         {
-            return string.Format("+{0}분 연장 (오늘 {1}회 남음)", config.ExtensionMinutes,
-                Math.Max(0, config.MaxExtensionsPerDay - state.ExtensionsUsed));
-        }
-
-        public bool TryExtend(IWin32Window owner)
-        {
-            if (!CanExtend())
+            int left = Math.Max(0, config.MaxExtensionsPerDay - state.ExtensionsUsed);
+            if (left <= 0 || config.ExtensionMinutes <= 0)
             {
-                MessageBox.Show(owner, "오늘은 더 이상 연장할 수 없습니다.", "PlayTimer");
-                return false;
+                ConfirmDialog.Info(owner, "더 연장할 수 없어요", "오늘 연장 횟수를 모두 썼어요. 내일 다시 쓸 수 있어요.");
+                return;
             }
-            var r = MessageBox.Show(owner,
-                string.Format("정말 {0}분 연장할까요?\n오늘 연장 가능 횟수가 1회 줄어듭니다.", config.ExtensionMinutes),
-                "PlayTimer", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2);
-            if (r != DialogResult.Yes) return false;
+            int choice = ConfirmDialog.Show(owner,
+                config.ExtensionMinutes + "분 연장할까요?",
+                string.Format("오늘 남은 연장 횟수가 {0}회에서 {1}회로 줄어요.", left, left - 1),
+                new[] { "연장하기", "취소" }, new[] { ButtonKind.Primary, ButtonKind.Ghost }, 1);
+            if (choice != 0) return;
 
             // 이미 초과한 시간은 연장분에서 깎이지 않도록, 초과분을 털어 낸다.
             double quotaOver = -QuotaRemaining();
@@ -377,33 +483,89 @@ namespace PlayTimer
             }
             prevRemaining = RemainingSeconds();
             SaveState();
+            CloseNag();
             UpdateTray();
-            if (activeNag != null) activeNag.Close();
-            return true;
+            Toast.Show(config.ExtensionMinutes + "분 연장했어요", "남은 시간 " + Ui.Clock(RemainingSeconds()), Ui.Blue);
         }
 
-        public void ConfirmShutdown(IWin32Window owner)
+        public void RequestShutdown(IWin32Window owner)
         {
-            var r = MessageBox.Show(owner, "1분 뒤에 PC를 끕니다. 저장할 것을 저장하세요.\n(취소하려면 명령 프롬프트에서 shutdown /a)",
-                "PlayTimer", MessageBoxButtons.OKCancel, MessageBoxIcon.Information);
-            if (r != DialogResult.OK) return;
+            int choice = ConfirmDialog.Show(owner, "PC를 끌까요?",
+                "1분 뒤에 꺼져요. 그 사이에 저장하거나 취소할 수 있어요.",
+                new[] { "끄기", "취소" }, new[] { ButtonKind.Danger, ButtonKind.Ghost }, 0);
+            if (choice != 0) return;
             SaveState();
+            if (!RunShutdown("/s /t 60")) return;
+
+            shuttingDown = true;
+            CloseNag();
+            if (shutdownNotice != null) shutdownNotice.Close();
+            shutdownNotice = new ShutdownNotice(60);
+            shutdownNotice.Cancelled += delegate
+            {
+                RunShutdown("/a");
+                shuttingDown = false;
+                lastNagClosed = DateTime.UtcNow;
+            };
+            shutdownNotice.FormClosed += delegate { shutdownNotice = null; };
+            shutdownNotice.Show();
+        }
+
+        static bool RunShutdown(string args)
+        {
             try
             {
-                Process.Start(new ProcessStartInfo("shutdown", "/s /t 60") { CreateNoWindow = true, UseShellExecute = false });
+                using (Process.Start(new ProcessStartInfo("shutdown", args) { CreateNoWindow = true, UseShellExecute = false })) { }
+                return true;
             }
             catch (Exception ex)
             {
-                MessageBox.Show(owner, "종료 명령 실행 실패: " + ex.Message, "PlayTimer");
+                ConfirmDialog.Info(null, "종료 명령을 실행하지 못했어요", ex.Message);
+                return false;
             }
         }
 
         void ConfirmExit()
         {
-            var r = MessageBox.Show("타이머를 끄면 오늘은 더 이상 알림이 뜨지 않습니다.\n정말 끌까요?",
-                "PlayTimer", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2);
-            if (r != DialogResult.Yes) return;
-            ExitThread();
+            int choice = ConfirmDialog.Show(null, "타이머를 끌까요?",
+                "끄면 오늘은 알림이 뜨지 않아요. 다음에 로그인하면 다시 켜져요.",
+                new[] { "계속 켜두기", "끄기" }, new[] { ButtonKind.Primary, ButtonKind.Ghost }, 0);
+            if (choice == 1) ExitThread();
+        }
+
+        public void OpenSchedule()
+        {
+            if (flyout != null) flyout.Close();
+            if (scheduleForm != null)
+            {
+                if (scheduleForm.WindowState == FormWindowState.Minimized) scheduleForm.WindowState = FormWindowState.Normal;
+                scheduleForm.Activate();
+                return;
+            }
+            scheduleForm = new ScheduleForm(schedule, config.ResetHour);
+            scheduleForm.Saved += delegate
+            {
+                schedule = scheduleForm.Result;
+                try { schedule.Save(schedulePath); }
+                catch (Exception ex) { ConfirmDialog.Info(null, "시간표를 저장하지 못했어요", ex.Message); }
+                lastIconKey = null;
+                UpdateTray();
+                Toast.Show("시간표를 저장했어요", WindowLineShort(), Ui.Blue);
+            };
+            scheduleForm.FormClosed += delegate { scheduleForm.Dispose(); scheduleForm = null; };
+            scheduleForm.Show();
+            scheduleForm.Activate();
+        }
+
+        void ToggleFlyout()
+        {
+            if (flyout != null) { flyout.Close(); return; }
+            // 아이콘을 누르는 순간 카드가 포커스를 잃어 닫혔다면 다시 열지 않는다(토글).
+            if ((DateTime.UtcNow - flyoutClosedAt).TotalMilliseconds < 300) return;
+            flyout = new StatusFlyout(this);
+            flyout.FormClosed += delegate { flyout = null; flyoutClosedAt = DateTime.UtcNow; };
+            flyout.Show();
+            flyout.Activate();
         }
 
         protected override void ExitThreadCore()
@@ -411,10 +573,20 @@ namespace PlayTimer
             tick.Stop();
             SystemEvents.SessionSwitch -= OnSessionSwitch;
             SaveState();
+            CloseNag();
+            foreach (var f in new Form[] { flyout, scheduleForm, shutdownNotice })
+                if (f != null) f.Close();
             tray.Visible = false;
             tray.Dispose();
-            if (lastIconHandle != IntPtr.Zero) DestroyIcon(lastIconHandle);
+            showEvent.Close();
+            FreeIcon(lastIconHandle);
             base.ExitThreadCore();
+        }
+
+        static void FreeIcon(IntPtr handle)
+        {
+            if (handle == IntPtr.Zero) return;
+            try { DestroyIcon(handle); } catch { }
         }
 
         void SaveState()
@@ -422,37 +594,17 @@ namespace PlayTimer
             try { state.Save(statePath); } catch { }
         }
 
-        void OpenSchedule()
-        {
-            if (scheduleForm != null)
-            {
-                scheduleForm.Activate();
-                return;
-            }
-            scheduleForm = new ScheduleForm(schedule, config.ResetHour);
-            scheduleForm.FormClosed += delegate
-            {
-                if (scheduleForm.DialogResult == DialogResult.OK)
-                {
-                    schedule = scheduleForm.Result;
-                    try { schedule.Save(schedulePath); }
-                    catch (Exception ex) { MessageBox.Show("시간표 저장 실패: " + ex.Message, "PlayTimer"); }
-                    lastIconText = null;
-                    UpdateTray();
-                }
-                scheduleForm.Dispose();
-                scheduleForm = null;
-            };
-            scheduleForm.Show();
-        }
+        // ── 트레이 ───────────────────────────────────────────────
 
         void UpdateMenu()
         {
             double rem = RemainingSeconds();
-            statusItem.Text = string.Format("{0}  (오늘 {1} 사용)",
-                rem > 0 ? "남은 시간 " + FormatTime(rem) : "초과 " + FormatTime(-rem), FormatTime(state.UsedSeconds));
-            extendItem.Text = ExtendLabel();
-            extendItem.Enabled = CanExtend();
+            menuHeader.Text = rem > 0 ? Ui.Clock(rem) + " 남음" : Ui.Clock(-rem) + " 초과";
+            menuHeader.ForeColor = rem <= 0 ? Ui.Red : rem <= 600 ? Ui.Amber : Ui.Text;
+            menuSub.Text = WindowLineShort();
+            int left = Math.Max(0, config.MaxExtensionsPerDay - state.ExtensionsUsed);
+            extendItem.Text = string.Format("{0}분 연장 ({1}회 남음)", config.ExtensionMinutes, left);
+            extendItem.Enabled = left > 0 && config.ExtensionMinutes > 0;
         }
 
         void UpdateTray()
@@ -460,352 +612,36 @@ namespace PlayTimer
             double rem = RemainingSeconds();
             bool over = rem <= 0;
             int minutes = (int)Math.Ceiling(Math.Abs(rem) / 60.0);
-            string text = over ? "+" + minutes : minutes.ToString();
+            string text = minutes.ToString();
             if (!over && minutes >= 100) text = (minutes / 60) + "h";
-            if (over && minutes >= 100) text = "!!";
+            if (over) text = minutes >= 100 ? "!" : "+" + minutes;
 
-            tray.Text = over
-                ? "PlayTimer - 시간 초과 " + FormatTime(-rem)
-                : "PlayTimer - 남은 시간 " + FormatTime(rem);
+            string tip = over ? "PlayTimer · " + Ui.Clock(-rem) + " 초과" : "PlayTimer · " + Ui.Clock(rem) + " 남음";
+            tray.Text = tip.Length > 63 ? tip.Substring(0, 63) : tip;
 
-            string key = text + (over ? "o" : rem <= 600 ? "w" : "n");
-            if (key == lastIconText) return;
-            lastIconText = key;
+            Color bg = over ? Ui.Red : rem <= 600 ? Ui.Amber : Ui.Blue;
+            string key = text + bg.ToArgb();
+            if (key == lastIconKey) return;
+            lastIconKey = key;
 
-            Color bg = over ? Color.FromArgb(200, 30, 30) : rem <= 600 ? Color.FromArgb(230, 140, 0) : Color.FromArgb(40, 120, 200);
             using (var bmp = new Bitmap(32, 32))
             {
                 using (var g = Graphics.FromImage(bmp))
                 using (var brush = new SolidBrush(bg))
-                using (var font = new Font("Segoe UI", text.Length >= 3 ? 11f : 15f, FontStyle.Bold, GraphicsUnit.Pixel))
+                using (var font = new Font("Segoe UI", text.Length >= 3 ? 13f : 18f, FontStyle.Bold, GraphicsUnit.Pixel))
+                using (var path = Ui.Round(new Rectangle(0, 0, 31, 31), 8))
                 {
-                    g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                    g.SmoothingMode = SmoothingMode.AntiAlias;
                     g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
-                    g.FillEllipse(brush, 0, 0, 31, 31);
+                    g.FillPath(brush, path);
                     var sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
-                    g.DrawString(text, font, Brushes.White, new RectangleF(0, 0, 32, 32), sf);
+                    g.DrawString(text, font, Brushes.White, new RectangleF(0, 1, 32, 32), sf);
                 }
                 IntPtr h = bmp.GetHicon();
                 tray.Icon = Icon.FromHandle(h);
-                if (lastIconHandle != IntPtr.Zero) DestroyIcon(lastIconHandle);
+                FreeIcon(lastIconHandle);
                 lastIconHandle = h;
             }
-        }
-
-        public static string FormatTime(double seconds)
-        {
-            var ts = TimeSpan.FromSeconds(Math.Max(0, seconds));
-            return string.Format("{0}:{1:00}:{2:00}", (int)ts.TotalHours, ts.Minutes, ts.Seconds);
-        }
-    }
-
-    // 화면 오른쪽 아래에 잠깐 떴다 사라지는 경고 (포커스를 뺏지 않음).
-    class Toast : Form
-    {
-        readonly System.Windows.Forms.Timer life = new System.Windows.Forms.Timer();
-
-        public static void Show(string message, bool urgent)
-        {
-            new Toast(message, urgent).Show();
-        }
-
-        Toast(string message, bool urgent)
-        {
-            FormBorderStyle = FormBorderStyle.None;
-            ShowInTaskbar = false;
-            TopMost = true;
-            StartPosition = FormStartPosition.Manual;
-            BackColor = urgent ? Color.FromArgb(200, 30, 30) : Color.FromArgb(35, 35, 40);
-            Size = new Size(360, 90);
-            var area = Screen.PrimaryScreen.WorkingArea;
-            Location = new Point(area.Right - Width - 16, area.Bottom - Height - 16);
-
-            var label = new Label
-            {
-                Text = message,
-                ForeColor = Color.White,
-                Font = new Font("맑은 고딕", 12f, FontStyle.Bold),
-                Dock = DockStyle.Fill,
-                TextAlign = ContentAlignment.MiddleCenter
-            };
-            label.Click += delegate { Close(); };
-            Controls.Add(label);
-
-            life.Interval = 8000;
-            life.Tick += delegate { life.Stop(); Close(); };
-            life.Start();
-        }
-
-        protected override bool ShowWithoutActivation { get { return true; } }
-
-        protected override void Dispose(bool disposing)
-        {
-            if (disposing) life.Dispose();
-            base.Dispose(disposing);
-        }
-    }
-
-    // 1~2단계: 항상 위에 뜨는 팝업. 2단계는 몇 초 동안 닫을 수 없다.
-    class NagForm : Form
-    {
-        readonly TrayApp app;
-        readonly Label overLabel;
-        readonly Button closeButton;
-        readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
-        readonly int stage;
-        int closeDelay;
-
-        public NagForm(TrayApp app, int stage, int closeDelaySeconds)
-        {
-            this.app = app;
-            this.stage = stage;
-            closeDelay = closeDelaySeconds;
-
-            Text = "PlayTimer";
-            FormBorderStyle = FormBorderStyle.FixedDialog;
-            MaximizeBox = false;
-            MinimizeBox = false;
-            ControlBox = false;
-            TopMost = true;
-            ShowInTaskbar = true;
-            StartPosition = FormStartPosition.CenterScreen;
-            BackColor = stage == 2 ? Color.FromArgb(120, 20, 20) : Color.FromArgb(35, 35, 40);
-            ClientSize = stage == 2 ? new Size(560, 300) : new Size(440, 220);
-
-            var title = new Label
-            {
-                Text = stage == 2 ? "진짜로 이제 그만할 시간입니다" : app.NagReason(),
-                ForeColor = Color.White,
-                Font = new Font("맑은 고딕", stage == 2 ? 20f : 15f, FontStyle.Bold),
-                AutoSize = false,
-                TextAlign = ContentAlignment.MiddleCenter,
-                Dock = DockStyle.Top,
-                Height = stage == 2 ? 90 : 70
-            };
-            overLabel = new Label
-            {
-                ForeColor = Color.FromArgb(255, 200, 200),
-                Font = new Font("맑은 고딕", stage == 2 ? 14f : 11f),
-                AutoSize = false,
-                TextAlign = ContentAlignment.MiddleCenter,
-                Dock = DockStyle.Top,
-                Height = 50
-            };
-
-            var buttons = new FlowLayoutPanel
-            {
-                Dock = DockStyle.Bottom,
-                Height = 60,
-                FlowDirection = FlowDirection.RightToLeft,
-                Padding = new Padding(10)
-            };
-            closeButton = MakeButton("조금만 더");
-            closeButton.Click += delegate { Close(); };
-            var shutdownButton = MakeButton("PC 끄기");
-            shutdownButton.Click += delegate { app.ConfirmShutdown(this); };
-            buttons.Controls.Add(closeButton);
-            buttons.Controls.Add(shutdownButton);
-            if (app.CanExtend())
-            {
-                var extendButton = MakeButton(app.ExtendLabel());
-                extendButton.Width = 220;
-                extendButton.Click += delegate { app.TryExtend(this); };
-                buttons.Controls.Add(extendButton);
-            }
-
-            Controls.Add(buttons);
-            Controls.Add(overLabel);
-            Controls.Add(title);
-
-            timer.Interval = 1000;
-            timer.Tick += delegate { Refresh2(); };
-            timer.Start();
-            Refresh2();
-        }
-
-        static Button MakeButton(string text)
-        {
-            return new Button
-            {
-                Text = text,
-                Width = 110,
-                Height = 36,
-                BackColor = Color.WhiteSmoke,
-                FlatStyle = FlatStyle.Flat,
-                Font = new Font("맑은 고딕", 9.5f)
-            };
-        }
-
-        void Refresh2()
-        {
-            overLabel.Text = stage == 2
-                ? app.NagReason() + " (초과 " + app.OvertimeText() + ")"
-                : "초과 시간: " + app.OvertimeText();
-            if (closeDelay > 0)
-            {
-                closeButton.Enabled = false;
-                closeButton.Text = string.Format("조금만 더 ({0})", closeDelay);
-                closeDelay--;
-            }
-            else
-            {
-                closeButton.Enabled = true;
-                closeButton.Text = "조금만 더";
-            }
-        }
-
-        protected override void OnFormClosing(FormClosingEventArgs e)
-        {
-            if (e.CloseReason == CloseReason.UserClosing && !closeButton.Enabled) e.Cancel = true;
-            base.OnFormClosing(e);
-        }
-
-        protected override void Dispose(bool disposing)
-        {
-            if (disposing) timer.Dispose();
-            base.Dispose(disposing);
-        }
-    }
-
-    // 3단계: 모든 모니터를 덮는 반투명 전체화면. 일정 시간 뒤에야 닫을 수 있다.
-    class OverlayNag : Form
-    {
-        readonly TrayApp app;
-        readonly Label overLabel;
-        readonly Button closeButton;
-        readonly List<Form> covers = new List<Form>();
-        readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
-        int closeDelay;
-
-        public OverlayNag(TrayApp app, int closeDelaySeconds)
-        {
-            this.app = app;
-            closeDelay = closeDelaySeconds;
-
-            ConfigureCover(this, Screen.PrimaryScreen);
-            Opacity = 0.92;
-
-            var panel = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 4, BackColor = Color.Transparent };
-            panel.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
-            panel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            panel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            panel.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
-
-            var title = new Label
-            {
-                Text = "그만!\n" + app.NagReason() + ".",
-                ForeColor = Color.White,
-                Font = new Font("맑은 고딕", 36f, FontStyle.Bold),
-                AutoSize = true,
-                Anchor = AnchorStyles.None,
-                TextAlign = ContentAlignment.MiddleCenter
-            };
-            overLabel = new Label
-            {
-                ForeColor = Color.FromArgb(255, 120, 120),
-                Font = new Font("맑은 고딕", 24f),
-                AutoSize = true,
-                Anchor = AnchorStyles.None,
-                TextAlign = ContentAlignment.MiddleCenter,
-                Margin = new Padding(0, 20, 0, 30)
-            };
-
-            var buttons = new FlowLayoutPanel { AutoSize = true, Anchor = AnchorStyles.Top, BackColor = Color.Transparent };
-            var shutdownButton = MakeButton("PC 끄기");
-            shutdownButton.Click += delegate { app.ConfirmShutdown(this); };
-            closeButton = MakeButton("");
-            closeButton.Click += delegate { Close(); };
-            buttons.Controls.Add(shutdownButton);
-            if (app.CanExtend())
-            {
-                var extendButton = MakeButton(app.ExtendLabel());
-                extendButton.Width = 300;
-                extendButton.Click += delegate { app.TryExtend(this); };
-                buttons.Controls.Add(extendButton);
-            }
-            buttons.Controls.Add(closeButton);
-
-            panel.Controls.Add(new Label { AutoSize = false }, 0, 0);
-            panel.Controls.Add(title, 0, 1);
-            panel.Controls.Add(overLabel, 0, 2);
-            panel.Controls.Add(buttons, 0, 3);
-            Controls.Add(panel);
-
-            // 보조 모니터는 검은 화면으로만 덮는다.
-            foreach (var screen in Screen.AllScreens)
-            {
-                if (screen.Primary) continue;
-                var cover = new Form();
-                ConfigureCover(cover, screen);
-                cover.Opacity = 0.92;
-                cover.FormClosing += delegate(object s, FormClosingEventArgs e)
-                {
-                    if (e.CloseReason == CloseReason.UserClosing) e.Cancel = true;
-                };
-                covers.Add(cover);
-            }
-            Shown += delegate { foreach (var c in covers) c.Show(); };
-            FormClosed += delegate
-            {
-                foreach (var c in covers) { c.Hide(); c.Dispose(); }
-            };
-
-            timer.Interval = 1000;
-            timer.Tick += delegate { Refresh2(); };
-            timer.Start();
-            Refresh2();
-        }
-
-        static void ConfigureCover(Form f, Screen screen)
-        {
-            f.FormBorderStyle = FormBorderStyle.None;
-            f.ShowInTaskbar = false;
-            f.TopMost = true;
-            f.StartPosition = FormStartPosition.Manual;
-            f.Bounds = screen.Bounds;
-            f.BackColor = Color.Black;
-        }
-
-        static Button MakeButton(string text)
-        {
-            return new Button
-            {
-                Text = text,
-                Width = 180,
-                Height = 50,
-                BackColor = Color.WhiteSmoke,
-                FlatStyle = FlatStyle.Flat,
-                Font = new Font("맑은 고딕", 12f),
-                Margin = new Padding(10)
-            };
-        }
-
-        void Refresh2()
-        {
-            overLabel.Text = "초과 시간 " + app.OvertimeText();
-            if (closeDelay > 0)
-            {
-                closeButton.Enabled = false;
-                closeButton.Text = string.Format("닫기 ({0})", closeDelay);
-                closeDelay--;
-            }
-            else
-            {
-                closeButton.Enabled = true;
-                closeButton.Text = "닫기";
-            }
-        }
-
-        protected override void OnFormClosing(FormClosingEventArgs e)
-        {
-            if (e.CloseReason == CloseReason.UserClosing && !closeButton.Enabled) e.Cancel = true;
-            base.OnFormClosing(e);
-        }
-
-        protected override void Dispose(bool disposing)
-        {
-            if (disposing) timer.Dispose();
-            base.Dispose(disposing);
         }
     }
 }
