@@ -174,6 +174,17 @@ namespace PlayTimer
         readonly string statePath;
         readonly string schedulePath;
         readonly string questsPath;
+        readonly string dataDir;
+        readonly string configPath;
+        readonly string prefsPath;
+        readonly AppPrefs prefs;
+        UpdateInfo latestUpdate;
+        bool checkingUpdate;
+        string updateError;
+        string notifiedUpdateTag;
+        AboutForm aboutForm;
+        readonly ToolStripMenuItem updateItem;
+        readonly System.Windows.Forms.Timer updateTimer;
         State state;
         Schedule schedule;
         QuestStore quests;
@@ -217,8 +228,11 @@ namespace PlayTimer
         public TrayApp()
         {
             string exeDir = Path.GetDirectoryName(Application.ExecutablePath);
-            config = Config.Load(Path.Combine(exeDir, "config.ini"));
-            string dataDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "PlayTimer");
+            configPath = Path.Combine(exeDir, "config.ini");
+            config = Config.Load(configPath);
+            dataDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "PlayTimer");
+            prefsPath = Path.Combine(dataDir, "app.txt");
+            prefs = AppPrefs.Load(prefsPath);
             statePath = Path.Combine(dataDir, "state.txt");
             schedulePath = Path.Combine(dataDir, "schedule.txt");
             questsPath = Path.Combine(dataDir, "quests.txt");
@@ -233,6 +247,7 @@ namespace PlayTimer
             menuSub = new ToolStripLabel { ForeColor = Ui.SubText, Margin = Ui.Pad(4, 0, 4, 6) };
             extendItem = new ToolStripMenuItem("", null, delegate { RequestExtend(null); });
             stopFocusItem = new ToolStripMenuItem("집중 그만하기", null, delegate { StopFocus(true); });
+            updateItem = new ToolStripMenuItem("", null, delegate { OpenAbout(); }) { Font = Ui.Font(9.5f, FontStyle.Bold), ForeColor = Ui.Green, Visible = false };
             var menu = new ContextMenuStrip { Font = Ui.Font(9.5f), ShowImageMargin = false };
             menu.Items.Add(menuHeader);
             menu.Items.Add(menuSub);
@@ -244,6 +259,9 @@ namespace PlayTimer
             menu.Items.Add(extendItem);
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(new ToolStripMenuItem("PC 끄기", null, delegate { RequestShutdown(null); }));
+            menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add(updateItem);
+            menu.Items.Add(new ToolStripMenuItem("정보 · v" + Updater.CurrentText, null, delegate { OpenAbout(); }));
             menu.Items.Add(new ToolStripMenuItem("타이머 종료", null, delegate { ConfirmExit(); }));
             menu.Opening += delegate { UpdateMenu(); };
 
@@ -266,6 +284,25 @@ namespace PlayTimer
             guard.Start();
 
             UpdateTray();
+            // 업데이트 확인: 켜고 20초 뒤 한 번, 그 뒤로는 12시간마다 (자동 확인이 켜져 있을 때)
+            updateTimer = new System.Windows.Forms.Timer { Interval = 20 * 1000 };
+            updateTimer.Tick += delegate
+            {
+                updateTimer.Interval = 30 * 60 * 1000;
+                if (prefs.AutoCheckUpdates && (DateTime.Now - prefs.LastCheck).TotalHours >= 12) CheckForUpdates(false);
+            };
+            updateTimer.Start();
+
+            // 방금 업데이트했다면 바뀐 점을 알려 준다.
+            string current = Updater.CurrentText;
+            if (prefs.LastRunVersion != current)
+            {
+                if (prefs.LastRunVersion.Length > 0)
+                    Toast.Show("v" + current + "(으)로 업데이트했어요", "눌러서 바뀐 점을 볼 수 있어요.", Ui.Green, OpenAbout);
+                prefs.LastRunVersion = current;
+                SavePrefs();
+            }
+
             // 켜자마자 조르지 않도록, 첫 알림까지 여유를 둔다.
             lastNagClosed = DateTime.UtcNow;
             if (firstRun)
@@ -741,6 +778,93 @@ namespace PlayTimer
             catch { }
         }
 
+        // ── 버전과 업데이트 ──────────────────────────────────────
+
+        public event EventHandler UpdateStateChanged;
+        public AppPrefs Prefs { get { return prefs; } }
+        public UpdateInfo LatestUpdate { get { return latestUpdate; } }
+        public bool CheckingUpdate { get { return checkingUpdate; } }
+        public string UpdateError { get { return updateError; } }
+        public string DataDir { get { return dataDir; } }
+        public string ConfigPath { get { return configPath; } }
+
+        public void SavePrefs() { prefs.Save(prefsPath); }
+
+        void RaiseUpdateState()
+        {
+            if (UpdateStateChanged != null) UpdateStateChanged(this, EventArgs.Empty);
+        }
+
+        // manual: 사용자가 직접 누른 확인. 자동 확인에서만 새 버전 알림을 띄운다.
+        public void CheckForUpdates(bool manual)
+        {
+            if (checkingUpdate) return;
+            checkingUpdate = true;
+            updateError = null;
+            RaiseUpdateState();
+            Updater.CheckAsync(ui, delegate(UpdateInfo info, Exception error)
+            {
+                checkingUpdate = false;
+                if (error != null) updateError = error.Message;
+                else
+                {
+                    latestUpdate = info;
+                    prefs.LastCheckUtcTicks = DateTime.UtcNow.Ticks;
+                    SavePrefs();
+                }
+                bool newer = Updater.IsNewer(latestUpdate);
+                updateItem.Text = newer ? "업데이트 설치 · v" + Updater.Text(latestUpdate.Version) : "";
+                updateItem.Visible = newer;
+                if (newer && !manual && notifiedUpdateTag != latestUpdate.Tag)
+                {
+                    notifiedUpdateTag = latestUpdate.Tag;
+                    Toast.Show("새 버전 v" + Updater.Text(latestUpdate.Version) + "이 나왔어요", "눌러서 바뀐 점을 보고 업데이트할 수 있어요.", Ui.Green, OpenAbout);
+                }
+                RaiseUpdateState();
+            });
+        }
+
+        public void OpenAbout()
+        {
+            if (flyout != null) flyout.Close();
+            if (aboutForm != null)
+            {
+                if (aboutForm.WindowState == FormWindowState.Minimized) aboutForm.WindowState = FormWindowState.Normal;
+                aboutForm.Activate();
+                return;
+            }
+            aboutForm = new AboutForm(this);
+            aboutForm.FormClosed += delegate { aboutForm = null; };
+            aboutForm.Show();
+            aboutForm.Activate();
+            // 열 때마다 최신 상태를 확인한다(10분 안에 확인했으면 생략).
+            if (!checkingUpdate && (DateTime.Now - prefs.LastCheck).TotalMinutes >= 10) CheckForUpdates(true);
+        }
+
+        public void InstallUpdate(IWin32Window owner)
+        {
+            if (!Updater.IsNewer(latestUpdate)) return;
+            int choice = ConfirmDialog.Show(owner, "v" + Updater.Text(latestUpdate.Version) + "(으)로 업데이트할까요?",
+                "새 버전을 받아 설치한 뒤 다시 켜져요. 1분 정도 걸리고, 시간표·퀘스트·기록·설정은 그대로예요." +
+                (focus != null ? " 진행 중인 집중은 여기서 끝나요." : ""),
+                new[] { "업데이트", "나중에" }, new[] { ButtonKind.Primary, ButtonKind.Ghost }, 0);
+            if (choice != 0) return;
+            if (focus != null) StopFocus(false);
+            SaveState();
+            SaveQuests();
+            history.Save();
+            try { Updater.StartUpdate(); }
+            catch (Exception ex)
+            {
+                ConfirmDialog.Info(owner, "업데이트를 시작하지 못했어요", ex.Message);
+                return;
+            }
+            Toast.Show("업데이트를 받고 있어요", "잠시 뒤 새 버전으로 다시 켜져요.", Ui.Green);
+            var exit = new System.Windows.Forms.Timer { Interval = 1500 };
+            exit.Tick += delegate { exit.Stop(); ExitThread(); };
+            exit.Start();
+        }
+
         public void OpenHistory()
         {
             if (flyout != null) flyout.Close();
@@ -969,6 +1093,8 @@ namespace PlayTimer
             SaveState();
             SaveQuests();
             history.Save();
+            updateTimer.Stop();
+            if (aboutForm != null) aboutForm.Close();
             if (historyForm != null) historyForm.Close();
             if (hud != null) hud.Close();
             if (board != null) board.Close();

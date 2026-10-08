@@ -46,10 +46,16 @@ namespace PlayTimer
 
         public static void Show(string title, string body, Color accent)
         {
-            new Toast(title, body, accent).Show();
+            new Toast(title, body, accent, null).Show();
         }
 
-        Toast(string title, string body, Color accent) : base(Ui.DarkSurface, true, true)
+        // 누르면 onClick 을 실행하는 알림 (예: "바뀐 점 보기")
+        public static void Show(string title, string body, Color accent, Action onClick)
+        {
+            new Toast(title, body, accent, onClick).Show();
+        }
+
+        Toast(string title, string body, Color accent, Action onClick) : base(Ui.DarkSurface, true, true)
         {
             this.accent = accent;
             var stack = new FlowLayoutPanel
@@ -70,7 +76,7 @@ namespace PlayTimer
             Controls.Add(stack);
 
             foreach (Control c in new Control[] { this, stack, t, b })
-                c.Click += delegate { Close(); };
+                c.Click += delegate { Close(); if (onClick != null) onClick(); };
             Cursor = Cursors.Hand;
 
             var pref = stack.GetPreferredSize(Size.Empty);
@@ -453,6 +459,23 @@ namespace PlayTimer
                 Margin = Ui.Pad(0, 0, 0, 16)
             };
             historyLink.LinkClicked += delegate { Close(); app.OpenHistory(); };
+            LinkLabel updateLink = null;
+            if (Updater.IsNewer(app.LatestUpdate))
+            {
+                historyLink.Margin = Ui.Pad(0, 0, 0, 4);
+                updateLink = new LinkLabel
+                {
+                    Text = "새 버전 " + Updater.Text(app.LatestUpdate.Version) + "이 나왔어요 →",
+                    AutoSize = true,
+                    Font = Ui.Font(9.5f, FontStyle.Bold),
+                    LinkColor = Ui.Green,
+                    ActiveLinkColor = Ui.Green,
+                    LinkBehavior = LinkBehavior.HoverUnderline,
+                    BackColor = Color.Transparent,
+                    Margin = Ui.Pad(0, 0, 0, 16)
+                };
+                updateLink.LinkClicked += delegate { Close(); app.OpenAbout(); };
+            }
 
             var row = CardForm.ButtonRow(false);
             var questsButton = new UiButton("퀘스트", ButtonKind.Primary, false);
@@ -467,8 +490,8 @@ namespace PlayTimer
             row.Controls.Add(extendButton);
             row.Margin = Ui.Pad(-4, 0, 0, 0);
 
-            foreach (Control c in new Control[] { day, remainRow, bar, usage, window, extension, questLine, historyLink, row })
-                stack.Controls.Add(c);
+            foreach (Control c in new Control[] { day, remainRow, bar, usage, window, extension, questLine, historyLink, updateLink, row })
+                if (c != null) stack.Controls.Add(c);
             Controls.Add(stack);
 
             Refresh2();

@@ -69,7 +69,7 @@ irm https://raw.githubusercontent.com/APapeIsName/handle-my-pc/HEAD/install.ps1 
 |---|---|
 | 클릭 | 오늘 현황 카드 |
 | 더블클릭 | 오늘의 퀘스트 |
-| 오른쪽 클릭 | 메뉴 (퀘스트, 집중 그만하기, 사용 기록, 시간 설정, 연장, PC 끄기, 타이머 종료) |
+| 오른쪽 클릭 | 메뉴 (퀘스트, 집중 그만하기, 사용 기록, 시간 설정, 연장, PC 끄기, 업데이트, 정보, 타이머 종료) |
 
 집중 중에는 아이콘이 초록색이 되고, 목표까지 남은 분(목표가 없으면 집중한 분)이 표시돼요.
 
@@ -205,6 +205,16 @@ irm https://raw.githubusercontent.com/APapeIsName/handle-my-pc/HEAD/install.ps1 
 | `BedtimeWarnMinutes` | 30 | 취침 몇 분 전에 미리 알릴지 (0이면 안 알림) |
 | `BedtimeStartStage` | 2 | 취침 시각이 되면 몇 단계 알림부터 시작할지 (1~3) |
 
+## 업데이트
+
+![정보 창](docs/about.png)
+
+- 트레이 메뉴의 **정보 · v1.5.0**에서 지금 버전을 보고, **업데이트 확인**을 누를 수 있어요.
+- 켜져 있는 동안 **12시간마다 자동으로** 새 버전을 확인해요. 새 버전이 나오면 알림이 뜨고, 트레이 메뉴에 **업데이트 설치** 항목이 생겨요. 자동 확인은 정보 창에서 끌 수 있어요.
+- **지금 업데이트**를 누르면 새 버전을 받아 설치하고 다시 켜져요. 시간표, 퀘스트, 사용 기록, `config.ini`는 그대로예요. 문제가 생기면 원래 버전이 다시 켜지고, 기록은 `%TEMP%\PlayTimer-update.log`에 남아요.
+- 업데이트 뒤 처음 켜면 "업데이트했어요" 알림이 뜨고, 누르면 바뀐 점을 보여 줘요. 전체 변경 기록은 [CHANGELOG.md](CHANGELOG.md)에 있어요.
+- 정보 창에서 GitHub 페이지, 문제 신고, 데이터 폴더, 설정 파일로 바로 갈 수 있어요.
+
 ## 제거
 
 **설정 → 앱 → 설치된 앱**에서 PlayTimer를 찾아 **제거**를 누르세요. zip을 받은 폴더의 `uninstall.bat`을 실행해도 돼요.
@@ -233,6 +243,8 @@ src/
   QuestBoard.cs    오늘의 퀘스트 창, 퀘스트 편집 창
   Focus.cs         집중 모드: 앞 창 감시와 최소화, 위쪽 진행 막대
   History.cs       사용 기록: 앱별 구간, 자리 비움, 날짜별 파일
+  Updater.cs       새 버전 확인(GitHub Releases), 업데이트 실행, CHANGELOG 읽기
+  AboutForm.cs     정보 창: 버전, 업데이트, 바뀐 점, 도움 링크
   HistoryForm.cs   사용 기록 창: 주간 막대, 타임라인, 앱별 시간
   Schedule.cs      요일별 총량과 30분 단위 시간대
   ScheduleForm.cs  캘린더식 시간 설정 창
@@ -244,4 +256,8 @@ install.ps1        설치 스크립트 (install.bat이 호출)
 
 - `build.bat`을 실행하면 `PlayTimer.exe`가 만들어져요.
 - GitHub Actions가 push마다 윈도우에서 빌드를 확인해요.
-- 새 버전을 내려면 `src/AssemblyInfo.cs`의 버전을 올려서 기본 브랜치에 push하세요. 그 버전의 릴리스가 없으면 `PlayTimer.zip`이 담긴 Release가 자동으로 만들어져요.
+- 새 버전을 내려면:
+  1. `CHANGELOG.md` 맨 위에 `## X.Y.Z — 날짜` 항목을 쓰고,
+  2. `src/AssemblyInfo.cs`의 버전을 같은 번호로 올려서 기본 브랜치에 push하세요.
+  3. 그 버전의 릴리스가 없으면 `PlayTimer.zip`과 CHANGELOG 내용이 담긴 Release가 자동으로 만들어져요. CHANGELOG에 그 버전 항목이 없으면 빌드가 실패해요.
+- 앱은 GitHub의 최신 Release를 보고 업데이트를 알려요. CHANGELOG는 exe 안에도 들어가서 정보 창에 보여요.

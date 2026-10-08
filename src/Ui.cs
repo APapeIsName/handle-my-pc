@@ -34,6 +34,18 @@ namespace PlayTimer
 
         public static Icon AppIcon;
 
+        // exe 안에 넣어 둔 PlayTimer.ico 에서 가장 큰 그림을 꺼낸다(정보 창 로고용).
+        public static Bitmap LargeIcon()
+        {
+            try
+            {
+                using (var stream = typeof(Ui).Assembly.GetManifestResourceStream("PlayTimer.PlayTimer.ico"))
+                    if (stream != null) using (var icon = new Icon(stream, 256, 256)) return icon.ToBitmap();
+            }
+            catch { }
+            try { return AppIcon != null ? AppIcon.ToBitmap() : null; } catch { return null; }
+        }
+
         public static void Init()
         {
             try { AppIcon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
