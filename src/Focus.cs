@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -184,8 +184,12 @@ namespace PlayTimer
             bool warning = DateTime.UtcNow < warnUntil;
             if (warning) { note.Text = warnText; note.ForeColor = Color.FromArgb(255, 138, 128); }
             else if (reached) { note.Text = "목표 달성! 완료를 눌러 주세요"; note.ForeColor = Ui.Green; }
-            else if (f.Quest.Apps.Count > 0) { note.Text = "허용 앱 " + string.Join(", ", f.Quest.Apps.ToArray()); note.ForeColor = Ui.DarkSubText; }
-            else { note.Text = "앱 제한 없음"; note.ForeColor = Ui.DarkSubText; }
+            else
+            {
+                note.Text = (f.Quest.Apps.Count > 0 ? "허용 앱 " + string.Join(", ", f.Quest.Apps.ToArray()) : "앱 제한 없음")
+                    + (f.Quest.CountsAsPlay ? " · 놀이 시간 포함" : "");
+                note.ForeColor = Ui.DarkSubText;
+            }
             note.MaximumSize = new Size(Ui.S(280), Ui.S(20));
 
             var size = Controls[0].GetPreferredSize(Size.Empty);

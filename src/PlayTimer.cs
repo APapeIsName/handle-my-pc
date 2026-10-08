@@ -313,6 +313,8 @@ namespace PlayTimer
         // 일일 퀘스트를 끝내야 자유 시간이 열리는 설정이고, 아직 남았는가
         bool Gated()
         {
+            // 퀘스트를 하고 있는 동안은 "퀘스트 먼저" 잠금을 풀어 둔다.
+            if (focus != null) return false;
             return quests.LockFreeTime && quests.HasUnfinishedDaily(Today, TodayDow);
         }
 
@@ -361,7 +363,7 @@ namespace PlayTimer
 
         string WindowLineShort()
         {
-            if (focus != null) return "집중 중: " + focus.Quest.Title;
+            if (focus != null && !focus.Quest.CountsAsPlay) return "집중 중: " + focus.Quest.Title;
             var logical = Logical();
             if (Gated() && GraceRemaining() <= 0) return "일일 퀘스트를 끝내면 자유 시간이 열려요.";
             if (schedule.AlwaysAllowed()) return "시간대 제한 없이 총량만 적용돼요.";
@@ -393,7 +395,7 @@ namespace PlayTimer
             st.UsedSeconds = state.UsedSeconds;
             st.LimitSeconds = LimitSeconds();
             st.QuotaBinding = QuotaRemaining() <= WindowRemaining();
-            st.InWindow = focus != null || ((schedule.IsAllowed(logical) && !Gated()) || GraceRemaining() > 0);
+            st.InWindow = (focus != null && !focus.Quest.CountsAsPlay) || (schedule.IsAllowed(logical) && !Gated()) || GraceRemaining() > 0;
             st.WindowLine = "●  " + WindowLineShort();
             st.DayLabel = string.Format("{0}월 {1}일 ({2})", logical.Month, logical.Day, ScheduleForm.DayNames[(int)logical.DayOfWeek]);
             st.ExtensionsLeft = Math.Max(0, config.MaxExtensionsPerDay - state.ExtensionsUsed);
@@ -420,7 +422,7 @@ namespace PlayTimer
                 var names = quests.DailyFor(TodayDow).FindAll(q => !q.IsDone(Today)).ConvertAll(q => q.Title);
                 st.Tag = "퀘스트 먼저";
                 st.Reason = "오늘 퀘스트를 먼저 해요";
-                st.ReasonDetail = "남은 일일 퀘스트: " + string.Join(", ", names.ToArray()) + ". 퀘스트를 시작하면 알림이 멈춰요.";
+                st.ReasonDetail = "남은 일일 퀘스트: " + string.Join(", ", names.ToArray()) + ". 끝내고 체크하면 자유 시간이 열려요.";
             }
             else
             {
@@ -467,12 +469,15 @@ namespace PlayTimer
 
             if (focus != null)
             {
-                // 집중하는 동안은 놀이 시간(총량)을 쓰지 않고, 시간대·퀘스트 알림도 멈춘다.
                 bool wasReached = focus.Quest.TargetReached(Today);
                 focus.Elapsed += delta;
                 focus.Quest.AddProgress(Today, delta);
                 if (!wasReached && focus.Quest.TargetReached(Today))
                     Toast.Show("목표 시간을 채웠어요", focus.Quest.Title + " · 위쪽 막대에서 완료를 눌러 마무리하세요.", Ui.Green);
+            }
+            if (focus != null && !focus.Quest.CountsAsPlay)
+            {
+                // 놀이 시간에 넣지 않는 퀘스트: 총량을 쓰지 않고, 시간대·퀘스트 알림도 멈춘다.
                 outsideSeconds = 0;
                 prevRemaining = double.NaN;
                 if ((now - lastSave).TotalSeconds >= 30)
@@ -696,6 +701,7 @@ namespace PlayTimer
                     quest.Days = r.Days;
                     quest.TargetMinutes = r.TargetMinutes;
                     quest.Apps = r.Apps;
+                    quest.CountsAsPlay = r.CountsAsPlay;
                 }
             }
             SaveQuests();
@@ -713,7 +719,8 @@ namespace PlayTimer
             badWindow = IntPtr.Zero;
             if (board != null) board.WindowState = FormWindowState.Minimized;
             Toast.Show("집중 시작: " + quest.Title,
-                quest.Apps.Count > 0 ? "지금부터 " + string.Join(", ", quest.Apps.ToArray()) + "만 쓸 수 있어요." : "앱 제한 없이 시간을 재요.",
+                (quest.Apps.Count > 0 ? "지금부터 " + string.Join(", ", quest.Apps.ToArray()) + "만 쓸 수 있어요." : "앱 제한 없이 시간을 재요.")
+                + (quest.CountsAsPlay ? " 이 시간은 놀이 시간에 들어가요." : " 이 시간은 놀이 시간에서 빠져요."),
                 Ui.Green);
             NotifyQuestsChanged();
         }
@@ -892,7 +899,7 @@ namespace PlayTimer
 
             string tip = over ? "PlayTimer · " + Ui.Clock(-rem) + " 초과" : "PlayTimer · " + Ui.Clock(rem) + " 남음";
             Color bg = over ? Ui.Red : rem <= 600 ? Ui.Amber : Ui.Blue;
-            if (focus != null)
+            if (focus != null && (!focus.Quest.CountsAsPlay || !over))
             {
                 // 집중 중에는 초록 아이콘에 집중한 분(목표가 있으면 남은 분)을 표시한다.
                 double shown = focus.Quest.TargetMinutes > 0

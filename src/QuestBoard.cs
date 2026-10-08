@@ -53,7 +53,7 @@ namespace PlayTimer
 
             int y = Ui.S(86);
             intro = new Panel { Location = new Point(pad, y), Size = new Size(width - pad * 2, Ui.S(58)), BackColor = Color.FromArgb(232, 240, 254) };
-            var introText = Ui.Label("컴퓨터를 켠 이유가 뭐예요? 할 퀘스트를 골라 ▶ 시작을 누르면,\n그 퀘스트에 정한 앱만 쓸 수 있는 집중 모드가 돼요.",
+            var introText = Ui.Label("컴퓨터를 켠 이유부터 확인해요. 끝낸 퀘스트는 동그라미를 눌러 체크하세요.\n필요하면 '집중'을 눌러 정한 앱만 쓰면서 시간을 잴 수도 있어요.",
                 Ui.Font(9.5f), Color.FromArgb(23, 78, 166));
             introText.Location = Ui.P(14, 10);
             intro.Controls.Add(introText);
@@ -243,7 +243,8 @@ namespace PlayTimer
 
             bool focusing = app.Focus != null && app.Focus.Quest == quest;
             bool done = quest.IsDone(app.Today);
-            startButton = new UiButton(focusing ? "그만" : "▶  시작", focusing ? ButtonKind.Ghost : ButtonKind.Primary, false);
+            // 집중은 부가 기능이라 눈에 덜 띄는 버튼으로 둔다. 기본 동작은 왼쪽 동그라미 체크.
+            startButton = new UiButton(focusing ? "집중 그만" : "집중", ButtonKind.Ghost, false);
             startButton.Height = Ui.S(32);
             startButton.FitToText();
             startButton.Height = Ui.S(32);
@@ -317,7 +318,8 @@ namespace PlayTimer
                 parts.Add(string.Format("{0} / 목표 {1}", Ui.Duration((int)(quest.Progress(day) / 60)), Ui.Duration(quest.TargetMinutes)));
             else if (quest.Progress(day) >= 60)
                 parts.Add(Ui.Duration((int)(quest.Progress(day) / 60)) + " 집중");
-            parts.Add(quest.Apps.Count == 0 ? "앱 제한 없음" : "앱: " + string.Join(", ", quest.Apps.ToArray()));
+            if (quest.Apps.Count > 0) parts.Add("앱: " + string.Join(", ", quest.Apps.ToArray()));
+            if (quest.CountsAsPlay) parts.Add("놀이 시간 포함");
             return string.Join("  ·  ", parts.ToArray());
         }
 
@@ -424,6 +426,9 @@ namespace PlayTimer
         readonly Chip[] dayChips = new Chip[7];
         readonly FlowLayoutPanel daysRow, appsRow;
         readonly DurationStepper target;
+        readonly UiButton focusToggle;
+        readonly FlowLayoutPanel focusBox;
+        readonly CheckBox playBox;
         public bool Deleted;
 
         public QuestEditor(Quest source, bool isNew) : base(Ui.Surface, true, false)
@@ -482,7 +487,26 @@ namespace PlayTimer
             daysRow.Margin = Ui.Pad(0, 0, 0, 14);
             stack.Controls.Add(daysRow);
 
-            stack.Controls.Add(Caption("목표 시간"));
+            // 집중 모드는 부가 기능이라, 쓸 때만 펼쳐서 설정한다.
+            focusToggle = new UiButton("", ButtonKind.Ghost, false);
+            focusToggle.Margin = Ui.Pad(0, 0, 0, 10);
+            focusToggle.Click += delegate { SetFocusOpen(!focusBox.Visible); };
+            stack.Controls.Add(focusToggle);
+            focusBox = new FlowLayoutPanel
+            {
+                FlowDirection = FlowDirection.TopDown,
+                WrapContents = false,
+                AutoSize = true,
+                AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                BackColor = Color.Transparent,
+                Margin = Ui.Pad(0, 0, 0, 10)
+            };
+            var focusIntro = Ui.Label("퀘스트를 할 때 '집중'을 누르면 시간을 재고, 정한 앱만 쓰도록 다른 창을 내려 줘요.",
+                Ui.Font(8.5f), Ui.SubText);
+            focusIntro.MaximumSize = new Size(inner, 0);
+            focusIntro.Margin = Ui.Pad(0, 0, 0, 12);
+            focusBox.Controls.Add(focusIntro);
+            focusBox.Controls.Add(Caption("목표 시간"));
             var targetRow = Row();
             target = new DurationStepper(quest.TargetMinutes, 10, 600, m => m == 0 ? "없음" : Ui.Duration(m))
             {
@@ -494,9 +518,9 @@ namespace PlayTimer
             targetHint.Margin = Ui.Pad(0, 8, 0, 0);
             targetRow.Controls.Add(targetHint);
             targetRow.Margin = Ui.Pad(0, 0, 0, 14);
-            stack.Controls.Add(targetRow);
+            focusBox.Controls.Add(targetRow);
 
-            stack.Controls.Add(Caption("집중할 때 쓸 앱"));
+            focusBox.Controls.Add(Caption("집중할 때 쓸 앱"));
             appsRow = new FlowLayoutPanel
             {
                 AutoSize = true,
@@ -506,7 +530,7 @@ namespace PlayTimer
                 BackColor = Color.Transparent,
                 Margin = Ui.Pad(0, 0, 0, 6)
             };
-            stack.Controls.Add(appsRow);
+            focusBox.Controls.Add(appsRow);
 
             var addRow = Row();
             var running = new UiButton("실행 중인 앱에서 고르기  ▾", ButtonKind.Secondary, false);
@@ -525,12 +549,27 @@ namespace PlayTimer
             addRow.Controls.Add(appBox);
             addRow.Controls.Add(addApp);
             addRow.Margin = Ui.Pad(0, 0, 0, 4);
-            stack.Controls.Add(addRow);
+            focusBox.Controls.Add(addRow);
             var appHint = Ui.Label("비워 두면 앱 제한 없이 시간만 재요. 이름은 프로세스 이름이에요 (예: chrome, code, notion).",
                 Ui.Font(8.5f), Ui.SubText);
             appHint.MaximumSize = new Size(inner, 0);
-            appHint.Margin = Ui.Pad(0, 0, 0, 20);
-            stack.Controls.Add(appHint);
+            appHint.Margin = Ui.Pad(0, 0, 0, 14);
+            focusBox.Controls.Add(appHint);
+
+            playBox = new CheckBox
+            {
+                Text = "집중한 시간을 놀이 시간 총량에 포함",
+                Checked = quest.CountsAsPlay,
+                AutoSize = true,
+                ForeColor = Ui.Text,
+                Margin = Ui.Pad(0, 0, 0, 2)
+            };
+            focusBox.Controls.Add(playBox);
+            var playHint = Ui.Label("끄면 이 퀘스트를 하는 동안은 놀이 시간이 줄지 않고, 시간대 알림도 멈춰요.", Ui.Font(8.5f), Ui.SubText);
+            playHint.MaximumSize = new Size(inner, 0);
+            playHint.Margin = Ui.Pad(18, 0, 0, 6);
+            focusBox.Controls.Add(playHint);
+            stack.Controls.Add(focusBox);
 
             var buttons = new FlowLayoutPanel
             {
@@ -566,6 +605,7 @@ namespace PlayTimer
 
             SetDaily(quest.Daily);
             RebuildApps();
+            SetFocusOpen(quest.HasFocusSettings);
 
             Load += delegate
             {
@@ -614,6 +654,14 @@ namespace PlayTimer
             dailyChip.Selected = daily;
             onceChip.Selected = !daily;
             daysRow.Visible = daily;
+        }
+
+        void SetFocusOpen(bool open)
+        {
+            focusBox.Visible = open;
+            focusToggle.Text = (open ? "▴  " : "▾  ") + "집중 모드 설정 (선택)";
+            focusToggle.FitToText();
+            if (IsHandleCreated) ClientSize = Controls[0].GetPreferredSize(Size.Empty);
         }
 
         void AddApp(string name)
@@ -679,6 +727,7 @@ namespace PlayTimer
             }
             quest.Title = name;
             quest.TargetMinutes = target.Value;
+            quest.CountsAsPlay = playBox.Checked;
             DialogResult = DialogResult.OK;
             Close();
         }

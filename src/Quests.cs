@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Text;
@@ -14,6 +14,7 @@ namespace PlayTimer
         public bool[] Days = { true, true, true, true, true, true, true }; // DayOfWeek 순서(일=0)
         public int TargetMinutes;                                         // 0이면 목표 없음
         public List<string> Apps = new List<string>();                    // 집중할 때 허용할 앱(프로세스 이름)
+        public bool CountsAsPlay;                                         // 집중한 시간을 놀이 시간 총량에 넣을지
         public string DoneDay = "";                                       // 완료한 (논리적) 날짜
         public string ProgressDay = "";
         public double ProgressSeconds;
@@ -43,6 +44,12 @@ namespace PlayTimer
         {
             if (ProgressDay != day) { ProgressDay = day; ProgressSeconds = 0; }
             ProgressSeconds += seconds;
+        }
+
+        // 집중 모드 설정(목표 시간, 허용 앱, 놀이 시간 포함)을 하나라도 썼는가
+        public bool HasFocusSettings
+        {
+            get { return TargetMinutes > 0 || Apps.Count > 0 || CountsAsPlay; }
         }
 
         public bool TargetReached(string day)
@@ -176,6 +183,7 @@ namespace PlayTimer
                         cur.Apps.Clear();
                         foreach (var a in val.Split('|')) if (a.Trim().Length > 0) cur.Apps.Add(a.Trim());
                         break;
+                    case "play": cur.CountsAsPlay = val == "1"; break;
                     case "done": cur.DoneDay = val; break;
                     case "progressDay": cur.ProgressDay = val; break;
                     case "progress":
@@ -205,6 +213,7 @@ namespace PlayTimer
                 sb.AppendLine("days=" + new string(days));
                 sb.AppendLine("target=" + q.TargetMinutes);
                 sb.AppendLine("apps=" + string.Join("|", q.Apps.ToArray()));
+                sb.AppendLine("play=" + (q.CountsAsPlay ? "1" : "0"));
                 sb.AppendLine("done=" + q.DoneDay);
                 sb.AppendLine("progressDay=" + q.ProgressDay);
                 sb.AppendLine("progress=" + q.ProgressSeconds.ToString(System.Globalization.CultureInfo.InvariantCulture));
