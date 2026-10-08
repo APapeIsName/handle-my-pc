@@ -16,11 +16,15 @@ namespace PlayTimer
         public bool InWindow;
         public string WindowLine;       // "18:00 – 22:00 사용 가능" 등
         public string DayLabel;         // "10월 7일 (수)"
+        public string Tag = "시간 초과";  // 알림 머리말: 시간 초과 / 쉬는 시간 / 퀘스트 먼저
         public string Reason;           // 왜 조르는지 한 줄
         public string ReasonDetail;
         public string EscalationHint;   // 다음에 무슨 일이 일어나는지
         public int ExtensionsLeft;
         public int ExtensionMinutes;
+        public bool HasTodo;            // 오늘 남은 퀘스트가 있는가
+        public bool InFocus;
+        public string QuestLine;        // "일일 퀘스트 1/3 · 연속 2일 · Lv 2"
 
         public bool Over { get { return Remaining <= 0; } }
         public double OverSeconds { get { return Math.Max(0, -Remaining); } }
@@ -124,7 +128,7 @@ namespace PlayTimer
         readonly TrayApp app;
         readonly NagSize size;
         readonly Label header, big, title, detail, hint;
-        readonly UiButton shutdownButton, extendButton, closeButton;
+        readonly UiButton shutdownButton, extendButton, questButton, closeButton;
         readonly string closeText;
         readonly int closeDelay;
         readonly DateTime shownAt = DateTime.UtcNow;
@@ -171,10 +175,12 @@ namespace PlayTimer
             shutdownButton.Click += delegate { app.RequestShutdown(host); };
             extendButton = new UiButton("", ButtonKind.Secondary, true);
             extendButton.Click += delegate { app.RequestExtend(host); };
+            questButton = new UiButton("퀘스트 하기", ButtonKind.Secondary, true);
+            questButton.Click += delegate { app.OpenQuestsFromNag(); };
             closeButton = new UiButton(closeText + " (00)", ButtonKind.Ghost, true);
             closeButton.Click += delegate { host.Close(); };
             if (large)
-                foreach (var b in new[] { shutdownButton, extendButton, closeButton })
+                foreach (var b in new[] { shutdownButton, questButton, extendButton, closeButton })
                 {
                     b.Font = Ui.Font(12f, b == shutdownButton ? FontStyle.Bold : FontStyle.Regular);
                     b.FitToText();
@@ -183,6 +189,7 @@ namespace PlayTimer
 
             var row = CardForm.ButtonRow(false);
             row.Controls.Add(shutdownButton);
+            row.Controls.Add(questButton);
             row.Controls.Add(extendButton);
             row.Controls.Add(closeButton);
             if (large) row.Anchor = AnchorStyles.None;
@@ -204,16 +211,16 @@ namespace PlayTimer
             switch (size)
             {
                 case NagSize.Small:
-                    header.Text = "●  시간 초과  " + over;
+                    header.Text = "●  " + st.Tag + "  " + over;
                     title.Text = st.Reason;
                     break;
                 case NagSize.Medium:
-                    header.Text = "시간 초과";
+                    header.Text = st.Tag;
                     big.Text = over;
                     title.Text = "진짜로 이제 그만할 시간이에요";
                     break;
                 default:
-                    header.Text = "시간 초과";
+                    header.Text = st.Tag;
                     big.Text = over;
                     title.Text = "그만! 오늘은 여기까지";
                     break;
@@ -222,6 +229,7 @@ namespace PlayTimer
             hint.Text = st.EscalationHint;
 
             extendButton.Visible = st.CanExtend;
+            questButton.Visible = st.HasTodo;
             string ext = string.Format("{0}분 연장 ({1}회 남음)", st.ExtensionMinutes, st.ExtensionsLeft);
             if (extendButton.Text != ext) { extendButton.Text = ext; FitKeepHeight(extendButton); }
 
@@ -391,7 +399,7 @@ namespace PlayTimer
     class StatusFlyout : CardForm
     {
         readonly TrayApp app;
-        readonly Label day, remaining, remainingSuffix, usage, window, extension;
+        readonly Label day, remaining, remainingSuffix, usage, window, extension, questLine;
         readonly Panel bar;
         readonly UiButton extendButton;
         readonly Timer timer = new Timer();
@@ -429,22 +437,24 @@ namespace PlayTimer
             window = Ui.Label("", Ui.Font(10f), Ui.Text);
             window.Margin = Ui.Pad(0, 0, 0, 4);
             extension = Ui.Label("", Ui.Font(9.5f), Ui.SubText);
-            extension.Margin = Ui.Pad(0, 0, 0, 18);
+            extension.Margin = Ui.Pad(0, 0, 0, 4);
+            questLine = Ui.Label("", Ui.Font(9.5f), Ui.SubText);
+            questLine.Margin = Ui.Pad(0, 0, 0, 18);
 
             var row = CardForm.ButtonRow(false);
-            var settings = new UiButton("시간 설정", ButtonKind.Primary, false);
+            var questsButton = new UiButton("퀘스트", ButtonKind.Primary, false);
+            questsButton.Click += delegate { Close(); app.OpenQuests(false); };
+            var settings = new UiButton("시간 설정", ButtonKind.Secondary, false);
             settings.Click += delegate { Close(); app.OpenSchedule(); };
             extendButton = new UiButton("연장", ButtonKind.Secondary, false);
             // 확인 창이 뜨면 이 카드는 포커스를 잃어 닫히므로, 먼저 닫고 묻는다.
             extendButton.Click += delegate { Close(); app.RequestExtend(null); };
-            var shutdown = new UiButton("PC 끄기", ButtonKind.Ghost, false);
-            shutdown.Click += delegate { Close(); app.RequestShutdown(null); };
+            row.Controls.Add(questsButton);
             row.Controls.Add(settings);
             row.Controls.Add(extendButton);
-            row.Controls.Add(shutdown);
             row.Margin = Ui.Pad(-4, 0, 0, 0);
 
-            foreach (Control c in new Control[] { day, remainRow, bar, usage, window, extension, row })
+            foreach (Control c in new Control[] { day, remainRow, bar, usage, window, extension, questLine, row })
                 stack.Controls.Add(c);
             Controls.Add(stack);
 
@@ -475,7 +485,14 @@ namespace PlayTimer
             extension.Text = st.CanExtend
                 ? string.Format("오늘 연장 {0}회 남음 ({1}분씩)", st.ExtensionsLeft, st.ExtensionMinutes)
                 : "오늘은 더 연장할 수 없어요";
-            extendButton.Enabled = st.CanExtend;
+            extendButton.Enabled = st.CanExtend && !st.InFocus;
+            questLine.Text = st.QuestLine;
+            if (st.InFocus && app.Focus != null)
+            {
+                remaining.Text = Ui.Clock(app.Focus.Elapsed);
+                remaining.ForeColor = Ui.Green;
+                remainingSuffix.Text = "집중 중";
+            }
             if (st.CanExtend) extendButton.Text = "+" + st.ExtensionMinutes + "분";
             bar.Invalidate();
         }

@@ -55,6 +55,10 @@ namespace PlayTimer
         public int Stage3CloseDelaySeconds = 20;
         public int ExtensionMinutes = 30;
         public int MaxExtensionsPerDay = 1;
+        public bool ShowQuestsOnStart = true;
+        public int FocusBlockDelaySeconds = 3;
+        public string[] AlwaysAllowedApps = new string[0];
+        public int QuestXp = 10;
 
         public static Config Load(string path)
         {
@@ -84,6 +88,10 @@ namespace PlayTimer
                         case "Stage3CloseDelaySeconds": c.Stage3CloseDelaySeconds = int.Parse(val); break;
                         case "ExtensionMinutes": c.ExtensionMinutes = int.Parse(val); break;
                         case "MaxExtensionsPerDay": c.MaxExtensionsPerDay = int.Parse(val); break;
+                        case "ShowQuestsOnStart": c.ShowQuestsOnStart = val == "1" || val.ToLowerInvariant() == "true"; break;
+                        case "FocusBlockDelaySeconds": c.FocusBlockDelaySeconds = int.Parse(val); break;
+                        case "AlwaysAllowedApps": c.AlwaysAllowedApps = val.Split(new[] { ',', '|' }, StringSplitOptions.RemoveEmptyEntries); break;
+                        case "QuestXp": c.QuestXp = int.Parse(val); break;
                     }
                 }
                 catch (FormatException) { }
@@ -157,12 +165,20 @@ namespace PlayTimer
         readonly Config config;
         readonly string statePath;
         readonly string schedulePath;
+        readonly string questsPath;
         State state;
         Schedule schedule;
+        QuestStore quests;
+        FocusSession focus;
+        FocusHud hud;
+        QuestBoard board;
+        readonly System.Windows.Forms.Timer guard;
+        IntPtr badWindow = IntPtr.Zero;
+        DateTime badSince;
         readonly NotifyIcon tray;
         readonly System.Windows.Forms.Timer tick;
         readonly ToolStripLabel menuHeader, menuSub;
-        readonly ToolStripMenuItem extendItem;
+        readonly ToolStripMenuItem extendItem, stopFocusItem;
         readonly EventWaitHandle showEvent;
         readonly SynchronizationContext ui;
 
@@ -182,6 +198,8 @@ namespace PlayTimer
         string lastIconKey;
         IntPtr lastIconHandle = IntPtr.Zero;
 
+        public event EventHandler QuestsChanged;
+
         // 코드에서 조르기 창을 닫을 때는 "아직 못 닫음" 잠금을 무시한다.
         public bool ClosingByApp { get; private set; }
 
@@ -192,19 +210,24 @@ namespace PlayTimer
             string dataDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "PlayTimer");
             statePath = Path.Combine(dataDir, "state.txt");
             schedulePath = Path.Combine(dataDir, "schedule.txt");
+            questsPath = Path.Combine(dataDir, "quests.txt");
             bool firstRun = !File.Exists(schedulePath);
             state = State.Load(statePath);
             schedule = Schedule.Load(schedulePath, config.DailyLimitMinutes);
+            quests = QuestStore.Load(questsPath);
             RollDayIfNeeded();
 
             menuHeader = new ToolStripLabel { Font = Ui.Font(11f, FontStyle.Bold), Margin = Ui.Pad(4, 6, 4, 0) };
             menuSub = new ToolStripLabel { ForeColor = Ui.SubText, Margin = Ui.Pad(4, 0, 4, 6) };
             extendItem = new ToolStripMenuItem("", null, delegate { RequestExtend(null); });
+            stopFocusItem = new ToolStripMenuItem("집중 그만하기", null, delegate { StopFocus(true); });
             var menu = new ContextMenuStrip { Font = Ui.Font(9.5f), ShowImageMargin = false };
             menu.Items.Add(menuHeader);
             menu.Items.Add(menuSub);
             menu.Items.Add(new ToolStripSeparator());
-            menu.Items.Add(new ToolStripMenuItem("시간 설정...", null, delegate { OpenSchedule(); }) { Font = Ui.Font(9.5f, FontStyle.Bold) });
+            menu.Items.Add(new ToolStripMenuItem("오늘의 퀘스트...", null, delegate { OpenQuests(false); }) { Font = Ui.Font(9.5f, FontStyle.Bold) });
+            menu.Items.Add(stopFocusItem);
+            menu.Items.Add(new ToolStripMenuItem("시간 설정...", null, delegate { OpenSchedule(); }));
             menu.Items.Add(extendItem);
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(new ToolStripMenuItem("PC 끄기", null, delegate { RequestShutdown(null); }));
@@ -213,11 +236,11 @@ namespace PlayTimer
 
             tray = new NotifyIcon { ContextMenuStrip = menu, Visible = true };
             tray.MouseClick += delegate(object s, MouseEventArgs e) { if (e.Button == MouseButtons.Left) ToggleFlyout(); };
-            tray.MouseDoubleClick += delegate(object s, MouseEventArgs e) { if (e.Button == MouseButtons.Left) OpenSchedule(); };
+            tray.MouseDoubleClick += delegate(object s, MouseEventArgs e) { if (e.Button == MouseButtons.Left) OpenQuests(false); };
 
             ui = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
             showEvent = new EventWaitHandle(false, EventResetMode.AutoReset, Program.ShowEventName);
-            ThreadPool.RegisterWaitForSingleObject(showEvent, delegate { ui.Post(delegate { OpenSchedule(); }, null); }, null, -1, false);
+            ThreadPool.RegisterWaitForSingleObject(showEvent, delegate { ui.Post(delegate { OpenQuests(false); }, null); }, null, -1, false);
 
             SystemEvents.SessionSwitch += OnSessionSwitch;
 
@@ -225,11 +248,21 @@ namespace PlayTimer
             tick.Tick += delegate { OnTick(); };
             tick.Start();
 
+            guard = new System.Windows.Forms.Timer { Interval = 300 };
+            guard.Tick += delegate { GuardApps(); };
+            guard.Start();
+
             UpdateTray();
+            // 켜자마자 조르지 않도록, 첫 알림까지 여유를 둔다.
+            lastNagClosed = DateTime.UtcNow;
             if (firstRun)
             {
-                Toast.Show("PlayTimer를 시작했어요", "요일별 사용 시간과 시간대를 정해 주세요. 트레이 아이콘을 클릭하면 언제든 현황을 볼 수 있어요.", Ui.Blue);
+                Toast.Show("PlayTimer를 시작했어요", "요일별 사용 시간과 시간대를 정해 주세요. 트레이 아이콘을 더블클릭하면 오늘의 퀘스트를 적을 수 있어요.", Ui.Blue);
                 OpenSchedule();
+            }
+            else if (config.ShowQuestsOnStart && quests.Todo(Today, TodayDow).Count > 0)
+            {
+                OpenQuests(true);
             }
             else if (RemainingSeconds() > 0)
             {
@@ -252,14 +285,35 @@ namespace PlayTimer
             return DateTime.Now.AddHours(-config.ResetHour);
         }
 
-        void RollDayIfNeeded()
+        bool RollDayIfNeeded()
         {
             string today = Logical().ToString("yyyy-MM-dd");
-            if (state.Day != today)
+            if (state.Day == today) return false;
+            state = new State { Day = today, GraceUntilUtcTicks = state.GraceUntilUtcTicks };
+            SaveState();
+            return true;
+        }
+
+        // ── 퀘스트용 날짜 ────────────────────────────────────────
+
+        public string Today { get { return Logical().ToString("yyyy-MM-dd"); } }
+        public string Yesterday { get { return Logical().AddDays(-1).ToString("yyyy-MM-dd"); } }
+        public DayOfWeek TodayDow { get { return Logical().DayOfWeek; } }
+        public string DayLabel
+        {
+            get
             {
-                state = new State { Day = today, GraceUntilUtcTicks = state.GraceUntilUtcTicks };
-                SaveState();
+                var l = Logical();
+                return string.Format("{0}월 {1}일 ({2})", l.Month, l.Day, ScheduleForm.DayNames[(int)l.DayOfWeek]);
             }
+        }
+        public QuestStore Quests { get { return quests; } }
+        public FocusSession Focus { get { return focus; } }
+
+        // 일일 퀘스트를 끝내야 자유 시간이 열리는 설정이고, 아직 남았는가
+        bool Gated()
+        {
+            return quests.LockFreeTime && quests.HasUnfinishedDaily(Today, TodayDow);
         }
 
         double LimitSeconds()
@@ -281,8 +335,9 @@ namespace PlayTimer
         // 허용 시간대 기준 남은 시간. 시간대 밖이면 밖에서 쓴 시간만큼 음수.
         double WindowRemaining()
         {
-            double w = schedule.SecondsUntilWindowEnd(Logical());
             double g = GraceRemaining();
+            if (Gated()) return g > 0 ? g : -outsideSeconds;
+            double w = schedule.SecondsUntilWindowEnd(Logical());
             if (w > 0 || g > 0) return Math.Max(w, g);
             return -outsideSeconds;
         }
@@ -306,8 +361,10 @@ namespace PlayTimer
 
         string WindowLineShort()
         {
-            if (schedule.AlwaysAllowed()) return "시간대 제한 없이 총량만 적용돼요.";
+            if (focus != null) return "집중 중: " + focus.Quest.Title;
             var logical = Logical();
+            if (Gated() && GraceRemaining() <= 0) return "일일 퀘스트를 끝내면 자유 시간이 열려요.";
+            if (schedule.AlwaysAllowed()) return "시간대 제한 없이 총량만 적용돼요.";
             DateTime start, end;
             if (GraceRemaining() > 0 && !schedule.IsAllowed(logical))
                 return "연장 중이에요. " + When(logical.AddSeconds(GraceRemaining())) + "까지";
@@ -336,19 +393,38 @@ namespace PlayTimer
             st.UsedSeconds = state.UsedSeconds;
             st.LimitSeconds = LimitSeconds();
             st.QuotaBinding = QuotaRemaining() <= WindowRemaining();
-            st.InWindow = schedule.IsAllowed(logical) || GraceRemaining() > 0;
+            st.InWindow = focus != null || ((schedule.IsAllowed(logical) && !Gated()) || GraceRemaining() > 0);
             st.WindowLine = "●  " + WindowLineShort();
             st.DayLabel = string.Format("{0}월 {1}일 ({2})", logical.Month, logical.Day, ScheduleForm.DayNames[(int)logical.DayOfWeek]);
             st.ExtensionsLeft = Math.Max(0, config.MaxExtensionsPerDay - state.ExtensionsUsed);
             st.ExtensionMinutes = config.ExtensionMinutes;
+
+            var todo = quests.Todo(Today, TodayDow);
+            st.HasTodo = todo.Count > 0;
+            int total = quests.DailyFor(TodayDow).Count;
+            var questParts = new List<string>();
+            if (total > 0) questParts.Add(string.Format("일일 퀘스트 {0}/{1}", quests.DailyDone(Today, TodayDow), total));
+            int streak = quests.CurrentStreak(Today, Yesterday);
+            if (streak > 0) questParts.Add("연속 " + streak + "일");
+            questParts.Add("Lv " + quests.Level);
+            st.QuestLine = string.Join(" · ", questParts.ToArray());
+            st.InFocus = focus != null;
 
             if (QuotaRemaining() <= 0)
             {
                 st.Reason = "오늘 사용 시간이 끝났어요";
                 st.ReasonDetail = "오늘 총량 " + Ui.Duration((int)(LimitSeconds() / 60)) + "을 모두 썼어요.";
             }
+            else if (Gated() && GraceRemaining() <= 0)
+            {
+                var names = quests.DailyFor(TodayDow).FindAll(q => !q.IsDone(Today)).ConvertAll(q => q.Title);
+                st.Tag = "퀘스트 먼저";
+                st.Reason = "오늘 퀘스트를 먼저 해요";
+                st.ReasonDetail = "남은 일일 퀘스트: " + string.Join(", ", names.ToArray()) + ". 퀘스트를 시작하면 알림이 멈춰요.";
+            }
             else
             {
+                st.Tag = "쉬는 시간";
                 st.Reason = "지금은 쉬는 시간이에요";
                 DateTime? next = schedule.NextWindowStart(logical);
                 st.ReasonDetail = next.HasValue ? "다음 사용 가능 시간은 " + When(next.Value) + "이에요." : "이번 주에는 남은 시간대가 없어요.";
@@ -382,11 +458,35 @@ namespace PlayTimer
             // 절전/최대 절전 동안의 공백은 사용 시간으로 치지 않는다.
             if (delta < 0 || delta > 5) delta = 0;
 
-            RollDayIfNeeded();
+            if (RollDayIfNeeded())
+            {
+                NotifyQuestsChanged();
+                if (config.ShowQuestsOnStart && quests.Todo(Today, TodayDow).Count > 0) OpenQuests(true);
+            }
             if (locked) return;
 
+            if (focus != null)
+            {
+                // 집중하는 동안은 놀이 시간(총량)을 쓰지 않고, 시간대·퀘스트 알림도 멈춘다.
+                bool wasReached = focus.Quest.TargetReached(Today);
+                focus.Elapsed += delta;
+                focus.Quest.AddProgress(Today, delta);
+                if (!wasReached && focus.Quest.TargetReached(Today))
+                    Toast.Show("목표 시간을 채웠어요", focus.Quest.Title + " · 위쪽 막대에서 완료를 눌러 마무리하세요.", Ui.Green);
+                outsideSeconds = 0;
+                prevRemaining = double.NaN;
+                if ((now - lastSave).TotalSeconds >= 30)
+                {
+                    SaveState();
+                    SaveQuests();
+                    lastSave = now;
+                }
+                UpdateTray();
+                return;
+            }
+
             state.UsedSeconds += delta;
-            if (schedule.IsAllowed(Logical()) || GraceRemaining() > 0) outsideSeconds = 0;
+            if ((schedule.IsAllowed(Logical()) && !Gated()) || GraceRemaining() > 0) outsideSeconds = 0;
             else outsideSeconds += delta;
 
             double before = double.IsNaN(prevRemaining) ? double.MaxValue : prevRemaining;
@@ -536,6 +636,165 @@ namespace PlayTimer
             if (choice == 1) ExitThread();
         }
 
+        // ── 퀘스트와 집중 ────────────────────────────────────────
+
+        public void NotifyQuestsChanged()
+        {
+            if (QuestsChanged != null) QuestsChanged(this, EventArgs.Empty);
+            UpdateTray();
+        }
+
+        public void SaveQuests()
+        {
+            try { quests.Save(questsPath); } catch { }
+        }
+
+        public void OpenQuests(bool atStart)
+        {
+            if (flyout != null) flyout.Close();
+            if (board != null)
+            {
+                if (board.WindowState == FormWindowState.Minimized) board.WindowState = FormWindowState.Normal;
+                board.Activate();
+                return;
+            }
+            board = new QuestBoard(this, atStart);
+            board.FormClosed += delegate { board = null; };
+            board.Show();
+            board.Activate();
+        }
+
+        // 알림 창의 "퀘스트 하기": 알림을 닫고 퀘스트 창을 연다.
+        public void OpenQuestsFromNag()
+        {
+            CloseNag();
+            OpenQuests(false);
+        }
+
+        public void EditQuest(IWin32Window owner, Quest quest)
+        {
+            bool isNew = quest == null;
+            var source = quest ?? new Quest();
+            using (var editor = new QuestEditor(source, isNew))
+            {
+                if (owner != null) editor.ShowDialog(owner); else editor.ShowDialog();
+                if (editor.DialogResult != DialogResult.OK) return;
+                if (editor.Deleted)
+                {
+                    if (focus != null && focus.Quest == quest) StopFocus(false);
+                    quests.Quests.Remove(quest);
+                }
+                else if (isNew)
+                {
+                    quests.Quests.Add(editor.Result);
+                }
+                else
+                {
+                    var r = editor.Result;
+                    quest.Title = r.Title;
+                    quest.Daily = r.Daily;
+                    quest.Days = r.Days;
+                    quest.TargetMinutes = r.TargetMinutes;
+                    quest.Apps = r.Apps;
+                }
+            }
+            SaveQuests();
+            NotifyQuestsChanged();
+        }
+
+        public void StartFocus(Quest quest)
+        {
+            if (focus != null) StopFocus(false);
+            focus = new FocusSession { Quest = quest };
+            CloseNag();
+            if (flyout != null) flyout.Close();
+            hud = new FocusHud(this);
+            hud.Show();
+            badWindow = IntPtr.Zero;
+            if (board != null) board.WindowState = FormWindowState.Minimized;
+            Toast.Show("집중 시작: " + quest.Title,
+                quest.Apps.Count > 0 ? "지금부터 " + string.Join(", ", quest.Apps.ToArray()) + "만 쓸 수 있어요." : "앱 제한 없이 시간을 재요.",
+                Ui.Green);
+            NotifyQuestsChanged();
+        }
+
+        public void StopFocus(bool announce)
+        {
+            if (focus == null) return;
+            var f = focus;
+            focus = null;
+            if (hud != null) { hud.Close(); hud = null; }
+            SaveQuests();
+            // 집중을 마치자마자 조르지 않도록 한 번 쉬고 시작한다.
+            lastNagClosed = DateTime.UtcNow;
+            if (announce)
+                Toast.Show("집중을 마쳤어요", string.Format("{0} · {1}{2}", f.Quest.Title, Ui.Duration((int)(f.Elapsed / 60)),
+                    f.Blocked > 0 ? " · 딴짓 " + f.Blocked + "번 막음" : ""), Ui.Blue);
+            NotifyQuestsChanged();
+        }
+
+        public void CompleteFocus()
+        {
+            if (focus == null) return;
+            var q = focus.Quest;
+            StopFocus(false);
+            CompleteQuest(q);
+        }
+
+        public void CompleteQuest(Quest quest)
+        {
+            int levelBefore = quests.Level;
+            bool allDaily = quests.Complete(quest, Today, Yesterday, TodayDow, config.QuestXp);
+            if (focus != null && focus.Quest == quest) StopFocus(false);
+            SaveQuests();
+            if (allDaily)
+                Toast.Show("오늘 일일 퀘스트를 모두 끝냈어요!",
+                    string.Format("연속 {0}일 · +{1} XP{2}", quests.CurrentStreak(Today, Yesterday), config.QuestXp,
+                        quests.LockFreeTime ? " · 자유 시간이 열렸어요" : ""), Ui.Green);
+            else
+                Toast.Show("퀘스트 완료: " + quest.Title, "+" + config.QuestXp + " XP", Ui.Green);
+            if (quests.Level > levelBefore)
+                Toast.Show("레벨 업! Lv " + quests.Level, "꾸준함이 쌓이고 있어요.", Ui.Blue);
+            NotifyQuestsChanged();
+        }
+
+        public void UncompleteQuest(Quest quest)
+        {
+            quests.Uncomplete(quest, Today, Yesterday, config.QuestXp);
+            SaveQuests();
+            NotifyQuestsChanged();
+        }
+
+        // 집중 중에 허용되지 않은 앱이 맨 앞에 오면, 잠깐 경고한 뒤 최소화한다.
+        void GuardApps()
+        {
+            if (focus == null || focus.Quest.Apps.Count == 0 || locked || hud == null) { badWindow = IntPtr.Zero; return; }
+            string name;
+            IntPtr h = AppGuard.Foreground(out name);
+            if (h == IntPtr.Zero || AppGuard.IsAllowed(name, focus.Quest.Apps, config.AlwaysAllowedApps))
+            {
+                badWindow = IntPtr.Zero;
+                return;
+            }
+            if (h != badWindow)
+            {
+                badWindow = h;
+                badSince = DateTime.UtcNow;
+            }
+            double waited = (DateTime.UtcNow - badSince).TotalSeconds;
+            if (waited >= config.FocusBlockDelaySeconds)
+            {
+                AppGuard.Minimize(h);
+                focus.Blocked++;
+                hud.Warn(name + " 창을 내렸어요. 지금은 " + focus.Quest.Title + " 시간이에요");
+                badWindow = IntPtr.Zero;
+            }
+            else
+            {
+                hud.Warn(string.Format("{0}은(는) 지금 쓸 수 없어요 · {1}초 뒤 내려가요", name, (int)Math.Ceiling(config.FocusBlockDelaySeconds - waited)));
+            }
+        }
+
         public void OpenSchedule()
         {
             if (flyout != null) flyout.Close();
@@ -576,8 +835,12 @@ namespace PlayTimer
         protected override void ExitThreadCore()
         {
             tick.Stop();
+            guard.Stop();
             SystemEvents.SessionSwitch -= OnSessionSwitch;
             SaveState();
+            SaveQuests();
+            if (hud != null) hud.Close();
+            if (board != null) board.Close();
             CloseNag();
             foreach (var f in new Form[] { flyout, scheduleForm, shutdownNotice })
                 if (f != null) f.Close();
@@ -610,6 +873,12 @@ namespace PlayTimer
             int left = Math.Max(0, config.MaxExtensionsPerDay - state.ExtensionsUsed);
             extendItem.Text = string.Format("{0}분 연장 ({1}회 남음)", config.ExtensionMinutes, left);
             extendItem.Enabled = left > 0 && config.ExtensionMinutes > 0;
+            stopFocusItem.Visible = focus != null;
+            if (focus != null)
+            {
+                menuHeader.Text = "집중 중 " + Ui.Clock(focus.Elapsed);
+                menuHeader.ForeColor = Ui.Green;
+            }
         }
 
         void UpdateTray()
@@ -622,9 +891,19 @@ namespace PlayTimer
             if (over) text = minutes >= 100 ? "!" : "+" + minutes;
 
             string tip = over ? "PlayTimer · " + Ui.Clock(-rem) + " 초과" : "PlayTimer · " + Ui.Clock(rem) + " 남음";
-            tray.Text = tip.Length > 63 ? tip.Substring(0, 63) : tip;
-
             Color bg = over ? Ui.Red : rem <= 600 ? Ui.Amber : Ui.Blue;
+            if (focus != null)
+            {
+                // 집중 중에는 초록 아이콘에 집중한 분(목표가 있으면 남은 분)을 표시한다.
+                double shown = focus.Quest.TargetMinutes > 0
+                    ? Math.Max(0, focus.Quest.TargetMinutes * 60.0 - focus.Quest.Progress(Today))
+                    : focus.Elapsed;
+                int m = (int)Math.Ceiling(shown / 60.0);
+                text = m >= 100 ? (m / 60) + "h" : m.ToString();
+                bg = Ui.Green;
+                tip = "PlayTimer · 집중: " + focus.Quest.Title;
+            }
+            tray.Text = tip.Length > 63 ? tip.Substring(0, 63) : tip;
             string key = text + bg.ToArgb();
             if (key == lastIconKey) return;
             lastIconKey = key;

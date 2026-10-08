@@ -399,14 +399,21 @@ namespace PlayTimer
     // − 2시간 + 형태의 하루 총량 조절기. 휠, 방향키로도 바꿀 수 있다.
     class DurationStepper : Control
     {
-        const int Step = 30;
+        readonly int Step;
+        readonly int max;
+        readonly Func<int, string> format;
         int value;
         int hoverZone; // -1 빼기, 1 더하기, 0 없음
 
         public event EventHandler ValueChanged;
 
-        public DurationStepper(int minutes)
+        public DurationStepper(int minutes) : this(minutes, 30, 24 * 60, null) { }
+
+        public DurationStepper(int minutes, int step, int maxMinutes, Func<int, string> format)
         {
+            Step = step;
+            max = maxMinutes;
+            this.format = format;
             value = Clamp(minutes);
             SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw | ControlStyles.Selectable, true);
             TabStop = true;
@@ -415,7 +422,7 @@ namespace PlayTimer
 
         public int Value { get { return value; } }
 
-        static int Clamp(int v) { return Math.Max(0, Math.Min(24 * 60, v)); }
+        int Clamp(int v) { return Math.Max(0, Math.Min(max, v)); }
 
         public void SetValueSilently(int v)
         {
@@ -484,12 +491,13 @@ namespace PlayTimer
             {
                 TextRenderer.DrawText(g, "−", sym, new Rectangle(0, 0, w, Height), value > 0 ? Ui.Text : Ui.Line,
                     TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
-                TextRenderer.DrawText(g, "+", sym, new Rectangle(Width - w, 0, w, Height), value < 24 * 60 ? Ui.Text : Ui.Line,
+                TextRenderer.DrawText(g, "+", sym, new Rectangle(Width - w, 0, w, Height), value < max ? Ui.Text : Ui.Line,
                     TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
             }
-            string text = value % 60 == 0 ? (value / 60) + "시간" : (value / 60.0).ToString("0.0") + "시간";
+            string text = format != null ? format(value)
+                : value % 60 == 0 ? (value / 60) + "시간" : (value / 60.0).ToString("0.0") + "시간";
             TextRenderer.DrawText(g, text, Font, new Rectangle(w - Ui.S(4), 0, Width - 2 * w + Ui.S(8), Height),
-                value == 0 ? Ui.Red : Ui.Text, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+                value == 0 ? (format == null ? Ui.Red : Ui.SubText) : Ui.Text, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
         }
     }
 

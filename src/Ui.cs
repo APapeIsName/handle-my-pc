@@ -141,6 +141,9 @@ namespace PlayTimer
         bool hover, pressed;
         float progress = -1f;
 
+        // 지정하면 기본 글자색 대신 쓴다(예: 빨간 글씨의 삭제 버튼).
+        public Color? TextColor;
+
         public UiButton(string text, ButtonKind kind, bool dark)
         {
             this.kind = kind;
@@ -182,6 +185,7 @@ namespace PlayTimer
 
         Color BaseFore()
         {
+            if (TextColor.HasValue) return TextColor.Value;
             if (kind == ButtonKind.Primary || kind == ButtonKind.Danger) return Color.White;
             if (kind == ButtonKind.Ghost) return dark ? Ui.DarkSubText : Ui.SubText;
             return dark ? Ui.DarkText : Ui.Text;
