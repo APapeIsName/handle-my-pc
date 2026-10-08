@@ -439,7 +439,19 @@ namespace PlayTimer
             extension = Ui.Label("", Ui.Font(9.5f), Ui.SubText);
             extension.Margin = Ui.Pad(0, 0, 0, 4);
             questLine = Ui.Label("", Ui.Font(9.5f), Ui.SubText);
-            questLine.Margin = Ui.Pad(0, 0, 0, 18);
+            questLine.Margin = Ui.Pad(0, 0, 0, 4);
+            var historyLink = new LinkLabel
+            {
+                Text = "오늘 사용 기록 보기 →",
+                AutoSize = true,
+                Font = Ui.Font(9.5f),
+                LinkColor = Ui.Blue,
+                ActiveLinkColor = Ui.Blue,
+                LinkBehavior = LinkBehavior.HoverUnderline,
+                BackColor = Color.Transparent,
+                Margin = Ui.Pad(0, 0, 0, 16)
+            };
+            historyLink.LinkClicked += delegate { Close(); app.OpenHistory(); };
 
             var row = CardForm.ButtonRow(false);
             var questsButton = new UiButton("퀘스트", ButtonKind.Primary, false);
@@ -454,7 +466,7 @@ namespace PlayTimer
             row.Controls.Add(extendButton);
             row.Margin = Ui.Pad(-4, 0, 0, 0);
 
-            foreach (Control c in new Control[] { day, remainRow, bar, usage, window, extension, questLine, row })
+            foreach (Control c in new Control[] { day, remainRow, bar, usage, window, extension, questLine, historyLink, row })
                 stack.Controls.Add(c);
             Controls.Add(stack);
 

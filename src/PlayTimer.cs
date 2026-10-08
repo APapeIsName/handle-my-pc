@@ -59,6 +59,8 @@ namespace PlayTimer
         public int FocusBlockDelaySeconds = 3;
         public string[] AlwaysAllowedApps = new string[0];
         public int QuestXp = 10;
+        public int IdleMinutes = 5;
+        public int HistoryDays = 90;
 
         public static Config Load(string path)
         {
@@ -92,6 +94,8 @@ namespace PlayTimer
                         case "FocusBlockDelaySeconds": c.FocusBlockDelaySeconds = int.Parse(val); break;
                         case "AlwaysAllowedApps": c.AlwaysAllowedApps = val.Split(new[] { ',', '|' }, StringSplitOptions.RemoveEmptyEntries); break;
                         case "QuestXp": c.QuestXp = int.Parse(val); break;
+                        case "IdleMinutes": c.IdleMinutes = int.Parse(val); break;
+                        case "HistoryDays": c.HistoryDays = int.Parse(val); break;
                     }
                 }
                 catch (FormatException) { }
@@ -172,6 +176,8 @@ namespace PlayTimer
         FocusSession focus;
         FocusHud hud;
         QuestBoard board;
+        readonly UsageHistory history;
+        HistoryForm historyForm;
         readonly System.Windows.Forms.Timer guard;
         IntPtr badWindow = IntPtr.Zero;
         DateTime badSince;
@@ -215,6 +221,7 @@ namespace PlayTimer
             state = State.Load(statePath);
             schedule = Schedule.Load(schedulePath, config.DailyLimitMinutes);
             quests = QuestStore.Load(questsPath);
+            history = new UsageHistory(Path.Combine(dataDir, "history"), config.ResetHour, config.HistoryDays);
             RollDayIfNeeded();
 
             menuHeader = new ToolStripLabel { Font = Ui.Font(11f, FontStyle.Bold), Margin = Ui.Pad(4, 6, 4, 0) };
@@ -227,6 +234,7 @@ namespace PlayTimer
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(new ToolStripMenuItem("오늘의 퀘스트...", null, delegate { OpenQuests(false); }) { Font = Ui.Font(9.5f, FontStyle.Bold) });
             menu.Items.Add(stopFocusItem);
+            menu.Items.Add(new ToolStripMenuItem("사용 기록...", null, delegate { OpenHistory(); }));
             menu.Items.Add(new ToolStripMenuItem("시간 설정...", null, delegate { OpenSchedule(); }));
             menu.Items.Add(extendItem);
             menu.Items.Add(new ToolStripSeparator());
@@ -467,6 +475,10 @@ namespace PlayTimer
             }
             if (locked) return;
 
+            RecordUsage(delta);
+            if ((now - lastSave).TotalSeconds >= 30) history.Save();
+            if (historyForm != null && (int)now.TimeOfDay.TotalSeconds % 60 == 0) historyForm.RefreshIfToday();
+
             if (focus != null)
             {
                 bool wasReached = focus.Quest.TargetReached(Today);
@@ -641,6 +653,39 @@ namespace PlayTimer
             if (choice == 1) ExitThread();
         }
 
+        // ── 사용 기록 ────────────────────────────────────────────
+
+        // 맨 앞 창의 앱을 기록한다. 입력이 IdleMinutes 넘게 없으면 자리 비움으로 친다.
+        void RecordUsage(double delta)
+        {
+            if (delta <= 0) return;
+            string app;
+            AppGuard.Foreground(out app);
+            double idle = UsageHistory.IdleSeconds();
+            bool isIdle = config.IdleMinutes > 0 && idle >= config.IdleMinutes * 60.0;
+            var kind = isIdle ? UsageKind.Idle : focus != null ? UsageKind.Quest : UsageKind.Free;
+            try
+            {
+                history.Record(Today, DateTime.Now, delta, kind, isIdle ? "" : app ?? "", focus != null ? focus.Quest.Title : "", isIdle ? idle : 0);
+            }
+            catch { }
+        }
+
+        public void OpenHistory()
+        {
+            if (flyout != null) flyout.Close();
+            if (historyForm != null)
+            {
+                if (historyForm.WindowState == FormWindowState.Minimized) historyForm.WindowState = FormWindowState.Normal;
+                historyForm.Activate();
+                return;
+            }
+            historyForm = new HistoryForm(this, history);
+            historyForm.FormClosed += delegate { historyForm = null; };
+            historyForm.Show();
+            historyForm.Activate();
+        }
+
         // ── 퀘스트와 집중 ────────────────────────────────────────
 
         public void NotifyQuestsChanged()
@@ -752,6 +797,7 @@ namespace PlayTimer
         {
             int levelBefore = quests.Level;
             bool allDaily = quests.Complete(quest, Today, Yesterday, TodayDow, config.QuestXp);
+            history.AddDone(Today, DateTime.Now, quest.Title);
             if (focus != null && focus.Quest == quest) StopFocus(false);
             SaveQuests();
             if (allDaily)
@@ -768,6 +814,7 @@ namespace PlayTimer
         public void UncompleteQuest(Quest quest)
         {
             quests.Uncomplete(quest, Today, Yesterday, config.QuestXp);
+            history.RemoveDone(Today, quest.Title);
             SaveQuests();
             NotifyQuestsChanged();
         }
@@ -846,6 +893,8 @@ namespace PlayTimer
             SystemEvents.SessionSwitch -= OnSessionSwitch;
             SaveState();
             SaveQuests();
+            history.Save();
+            if (historyForm != null) historyForm.Close();
             if (hud != null) hud.Close();
             if (board != null) board.Close();
             CloseNag();
