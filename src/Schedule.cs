@@ -16,6 +16,8 @@ namespace PlayTimer
 
         // DayOfWeek 순서(일=0)로 저장한다.
         public readonly int[] LimitMinutes = new int[7];
+        // 취침 시각: 그 (논리적) 하루가 시작한 때로부터 몇 분 뒤인지. 0이면 정하지 않음.
+        public readonly int[] BedtimeMinutes = new int[7];
         public readonly bool[][] Allowed = new bool[7][];
 
         public Schedule(int defaultLimitMinutes)
@@ -34,6 +36,7 @@ namespace PlayTimer
             for (int d = 0; d < 7; d++)
             {
                 c.LimitMinutes[d] = LimitMinutes[d];
+                c.BedtimeMinutes[d] = BedtimeMinutes[d];
                 Array.Copy(Allowed[d], c.Allowed[d], SlotsPerDay);
             }
             return c;
@@ -57,6 +60,11 @@ namespace PlayTimer
                     int n;
                     if (int.TryParse(val, out n) && n >= 0) s.LimitMinutes[d] = Math.Min(n, 24 * 60);
                 }
+                else if (field == "bed")
+                {
+                    int n;
+                    if (int.TryParse(val, out n) && n >= 0 && n < 24 * 60) s.BedtimeMinutes[d] = n;
+                }
                 else if (field == "slots" && val.Length == SlotsPerDay)
                 {
                     for (int i = 0; i < SlotsPerDay; i++) s.Allowed[d][i] = val[i] == '1';
@@ -73,6 +81,7 @@ namespace PlayTimer
             for (int d = 0; d < 7; d++)
             {
                 sb.AppendLine(Keys[d] + ".limit=" + LimitMinutes[d]);
+                sb.AppendLine(Keys[d] + ".bed=" + BedtimeMinutes[d]);
                 var slots = new char[SlotsPerDay];
                 for (int i = 0; i < SlotsPerDay; i++) slots[i] = Allowed[d][i] ? '1' : '0';
                 sb.AppendLine(Keys[d] + ".slots=" + new string(slots));
@@ -81,6 +90,14 @@ namespace PlayTimer
             File.WriteAllText(tmp, sb.ToString(), new UTF8Encoding(true));
             if (File.Exists(path)) File.Delete(path);
             File.Move(tmp, path);
+        }
+
+        // 취침 시각까지 남은 초. 지났으면 음수(지난 만큼). 취침 시각이 없으면 double.MaxValue.
+        public double SecondsUntilBedtime(DateTime logical)
+        {
+            int bed = BedtimeMinutes[(int)logical.DayOfWeek];
+            if (bed <= 0) return double.MaxValue;
+            return bed * 60.0 - logical.TimeOfDay.TotalSeconds;
         }
 
         public bool AlwaysAllowed()

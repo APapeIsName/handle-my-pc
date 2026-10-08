@@ -130,6 +130,7 @@ namespace PlayTimer
             for (int d = 0; d < 7; d++)
             {
                 if (original.LimitMinutes[d] != schedule.LimitMinutes[d]) return true;
+                if (original.BedtimeMinutes[d] != schedule.BedtimeMinutes[d]) return true;
                 for (int s = 0; s < Schedule.SlotsPerDay; s++)
                     if (original.Allowed[d][s] != schedule.Allowed[d][s]) return true;
             }
@@ -190,6 +191,8 @@ namespace PlayTimer
             menu.Items.Add(new ToolStripLabel(name) { Font = Ui.Font(9.5f, FontStyle.Bold), ForeColor = Ui.SubText });
             menu.Items.Add(name + " 하루 종일 칠하기", null, delegate { FillDay(day, true); });
             menu.Items.Add(name + " 모두 지우기", null, delegate { FillDay(day, false); });
+            if (schedule.BedtimeMinutes[(int)day] > 0)
+                menu.Items.Add(name + " 취침 시간 없애기", null, delegate { schedule.BedtimeMinutes[(int)day] = 0; OnChanged(); });
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("이 설정을 평일(월~금)에 복사", null, delegate { CopyDay(day, DayOfWeek.Monday, DayOfWeek.Tuesday, DayOfWeek.Wednesday, DayOfWeek.Thursday, DayOfWeek.Friday); });
             menu.Items.Add("이 설정을 주말(토·일)에 복사", null, delegate { CopyDay(day, DayOfWeek.Saturday, DayOfWeek.Sunday); });
@@ -200,7 +203,7 @@ namespace PlayTimer
         ContextMenuStrip QuickMenu()
         {
             var menu = NewMenu();
-            menu.Items.Add("예시: 평일 저녁 2시간 · 주말 4시간", null, delegate { ApplyExample(); });
+            menu.Items.Add("예시: 평일 저녁 2시간 · 주말 4시간 · 자정 취침", null, delegate { ApplyExample(); });
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("시간대 제한 없애기 (모두 칠하기)", null, delegate { foreach (var d in Order) FillDay(d, true); });
             menu.Items.Add("시간대 모두 지우기", null, delegate { foreach (var d in Order) FillDay(d, false); });
@@ -224,6 +227,7 @@ namespace PlayTimer
             {
                 if (t == from) continue;
                 schedule.LimitMinutes[(int)t] = schedule.LimitMinutes[(int)from];
+                schedule.BedtimeMinutes[(int)t] = schedule.BedtimeMinutes[(int)from];
                 Array.Copy(schedule.Allowed[(int)from], schedule.Allowed[(int)t], Schedule.SlotsPerDay);
             }
             OnChanged();
@@ -234,6 +238,7 @@ namespace PlayTimer
             for (int d = 0; d < 7; d++)
             {
                 schedule.LimitMinutes[d] = source.LimitMinutes[d];
+                schedule.BedtimeMinutes[d] = source.BedtimeMinutes[d];
                 Array.Copy(source.Allowed[d], schedule.Allowed[d], Schedule.SlotsPerDay);
             }
             OnChanged();
@@ -255,6 +260,9 @@ namespace PlayTimer
             {
                 bool weekend = d == DayOfWeek.Saturday || d == DayOfWeek.Sunday;
                 schedule.LimitMinutes[(int)d] = weekend ? 240 : 120;
+                // 평일 00:00, 주말 01:00에 잔다 (금·토 밤이 주말 칸)
+                bool lateNight = d == DayOfWeek.Friday || d == DayOfWeek.Saturday;
+                schedule.BedtimeMinutes[(int)d] = (((lateNight ? 25 : 24) - resetHour) * 60);
                 if (weekend) SetRange(d, 10, 24); else SetRange(d, 18, 23);
             }
             OnChanged();
@@ -273,7 +281,10 @@ namespace PlayTimer
         readonly Schedule schedule;
         readonly int resetHour;
         readonly DurationStepper[] steppers = new DurationStepper[7];
+        readonly DurationStepper[] bedSteppers = new DurationStepper[7];
         int hoverCol = -1;
+
+        public const int BedRowY = 98, AllowedRowY = 134;
 
         public event EventHandler Changed;
         public event EventHandler<DayMenuEventArgs> DayMenuRequested;
@@ -283,7 +294,7 @@ namespace PlayTimer
             this.schedule = schedule;
             this.resetHour = resetHour;
             SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
-            Size = new Size(ScheduleForm.Gutter + ScheduleForm.ColWidth * 7, Ui.S(118));
+            Size = new Size(ScheduleForm.Gutter + ScheduleForm.ColWidth * 7, Ui.S(156));
             BackColor = Ui.Surface;
 
             for (int i = 0; i < 7; i++)
@@ -301,14 +312,39 @@ namespace PlayTimer
                 };
                 steppers[i] = stepper;
                 Controls.Add(stepper);
+
+                // 취침 시각: 하루 시작(ResetHour)부터 몇 분 뒤인지. "없음"에서 +를 누르면 23:00부터.
+                var bed = new DurationStepper(schedule.BedtimeMinutes[d], 30, 24 * 60 - 30, m => m == 0 ? "없음" : BedClock(resetHour, m))
+                {
+                    Location = new Point(ScheduleForm.Gutter + i * ScheduleForm.ColWidth + Ui.S(6), Ui.S(BedRowY)),
+                    Size = new Size(ScheduleForm.ColWidth - Ui.S(12), Ui.S(30)),
+                    JumpFromZero = Math.Max(60, ((23 - resetHour + 24) % 24) * 60),
+                    MinNonZero = 8 * 60
+                };
+                bed.ValueChanged += delegate
+                {
+                    schedule.BedtimeMinutes[d] = bed.Value;
+                    if (Changed != null) Changed(this, EventArgs.Empty);
+                };
+                bedSteppers[i] = bed;
+                Controls.Add(bed);
             }
+        }
+
+        public static string BedClock(int resetHour, int minutes)
+        {
+            int m = (resetHour * 60 + minutes) % (24 * 60);
+            return string.Format("{0:00}:{1:00}", m / 60, m % 60);
         }
 
         protected override void OnInvalidated(InvalidateEventArgs e)
         {
             // 복사·되돌리기 등으로 값이 바뀌었을 수 있으니 조절기를 다시 맞춘다.
             for (int i = 0; i < 7; i++)
+            {
                 steppers[i].SetValueSilently(schedule.LimitMinutes[(int)ScheduleForm.Order[i]]);
+                bedSteppers[i].SetValueSilently(schedule.BedtimeMinutes[(int)ScheduleForm.Order[i]]);
+            }
             base.OnInvalidated(e);
         }
 
@@ -360,7 +396,9 @@ namespace PlayTimer
             {
                 TextRenderer.DrawText(g, "총량", small, new Rectangle(0, Ui.S(62), ScheduleForm.Gutter - Ui.S(8), Ui.S(30)), Ui.SubText,
                     TextFormatFlags.Right | TextFormatFlags.VerticalCenter);
-                TextRenderer.DrawText(g, "시간대", small, new Rectangle(0, Ui.S(96), ScheduleForm.Gutter - Ui.S(8), Ui.S(18)), Ui.SubText,
+                TextRenderer.DrawText(g, "취침", small, new Rectangle(0, Ui.S(BedRowY), ScheduleForm.Gutter - Ui.S(8), Ui.S(30)), Ui.SubText,
+                    TextFormatFlags.Right | TextFormatFlags.VerticalCenter);
+                TextRenderer.DrawText(g, "시간대", small, new Rectangle(0, Ui.S(AllowedRowY), ScheduleForm.Gutter - Ui.S(8), Ui.S(18)), Ui.SubText,
                     TextFormatFlags.Right | TextFormatFlags.VerticalCenter);
 
                 for (int i = 0; i < 7; i++)
@@ -389,7 +427,7 @@ namespace PlayTimer
                     bool tooShort = allowed < schedule.LimitMinutes[d];
                     string text = allowed >= 24 * 60 ? "제한 없음" : allowed == 0 ? "없음" : Ui.Duration(allowed);
                     if (tooShort) text += " ⚠";
-                    TextRenderer.DrawText(g, text, tiny, new Rectangle(x, Ui.S(96), colW, Ui.S(18)), tooShort ? Ui.Amber : Ui.SubText,
+                    TextRenderer.DrawText(g, text, tiny, new Rectangle(x, Ui.S(AllowedRowY), colW, Ui.S(18)), tooShort ? Ui.Amber : Ui.SubText,
                         TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
                 }
             }
@@ -403,6 +441,10 @@ namespace PlayTimer
         readonly int max;
         readonly Func<int, string> format;
         int value;
+
+        // 0을 "없음"으로 쓰는 조절기용: 0에서 +를 누르면 JumpFromZero로, MinNonZero 아래로 내리면 0으로.
+        public int JumpFromZero;
+        public int MinNonZero;
         int hoverZone; // -1 빼기, 1 더하기, 0 없음
 
         public event EventHandler ValueChanged;
@@ -432,7 +474,13 @@ namespace PlayTimer
 
         void Change(int delta)
         {
-            int v = Clamp(value + delta);
+            int v;
+            if (value == 0 && delta > 0 && JumpFromZero > 0) v = JumpFromZero;
+            else
+            {
+                v = Clamp(value + delta);
+                if (MinNonZero > 0 && v > 0 && v < MinNonZero) v = delta < 0 ? 0 : MinNonZero;
+            }
             if (v == value) return;
             value = v;
             Invalidate();
@@ -734,6 +782,27 @@ namespace PlayTimer
                                 Color.FromArgb(220, 232, 253), TextFormatFlags.Left | TextFormatFlags.Top);
                         }
                     }
+                }
+            }
+
+            // 취침 시각 이후는 남색으로 덮는다(칠해 둔 시간대도 이때부터는 쓸 수 없다).
+            using (var night = new SolidBrush(Color.FromArgb(70, 32, 33, 80)))
+            using (var nightLine = new Pen(Color.FromArgb(57, 73, 171), Math.Max(1, Ui.S(2))))
+            using (var nightFont = Ui.Font(8f, FontStyle.Bold))
+            {
+                for (int c = 0; c < 7; c++)
+                {
+                    int bed = schedule.BedtimeMinutes[(int)ScheduleForm.Order[c]];
+                    if (bed <= 0) continue;
+                    int y = bed * RowHeight / Schedule.SlotMinutes;
+                    int x = Gutter + c * ColW;
+                    g.FillRectangle(night, x + 1, y, ColW - 1, Height - y);
+                    g.DrawLine(nightLine, x + 1, y, x + ColW - 1, y);
+                    var tag = "취침 " + DayHeader.BedClock(resetHour, bed);
+                    var size = TextRenderer.MeasureText(tag, nightFont);
+                    var tagRect = new Rectangle(x + ColW - size.Width - Ui.S(10), y + Ui.S(3), size.Width + Ui.S(6), size.Height);
+                    using (var tagBack = new SolidBrush(Color.FromArgb(57, 73, 171))) g.FillRectangle(tagBack, tagRect);
+                    TextRenderer.DrawText(g, tag, nightFont, tagRect, Color.White, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
                 }
             }
 

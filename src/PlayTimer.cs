@@ -61,6 +61,8 @@ namespace PlayTimer
         public int QuestXp = 10;
         public int IdleMinutes = 5;
         public int HistoryDays = 90;
+        public int BedtimeWarnMinutes = 30;
+        public int BedtimeStartStage = 2;
 
         public static Config Load(string path)
         {
@@ -96,6 +98,8 @@ namespace PlayTimer
                         case "QuestXp": c.QuestXp = int.Parse(val); break;
                         case "IdleMinutes": c.IdleMinutes = int.Parse(val); break;
                         case "HistoryDays": c.HistoryDays = int.Parse(val); break;
+                        case "BedtimeWarnMinutes": c.BedtimeWarnMinutes = int.Parse(val); break;
+                        case "BedtimeStartStage": c.BedtimeStartStage = Math.Max(1, Math.Min(3, int.Parse(val))); break;
                     }
                 }
                 catch (FormatException) { }
@@ -194,6 +198,7 @@ namespace PlayTimer
         DateTime flyoutClosedAt = DateTime.MinValue;
         double outsideSeconds;
         double prevRemaining = double.NaN;
+        double prevBedtime = double.NaN;
         bool locked;
         bool shuttingDown;
         Form activeNag;
@@ -352,10 +357,35 @@ namespace PlayTimer
             return -outsideSeconds;
         }
 
-        // 총량과 시간대 중 먼저 끝나는 쪽
+        // 취침 시각까지 남은 초(지났으면 음수). 취침 시각이 없으면 double.MaxValue.
+        double BedtimeRemaining()
+        {
+            return schedule.SecondsUntilBedtime(Logical());
+        }
+
+        // 취침 시각이 지났는가. 지나면 남은 시간·연장·집중과 상관없이 종료를 알린다.
+        bool PastBedtime()
+        {
+            return BedtimeRemaining() <= 0;
+        }
+
+        // 총량, 시간대, 취침 중 먼저 끝나는 쪽
         double RemainingSeconds()
         {
-            return Math.Min(QuotaRemaining(), WindowRemaining());
+            return Math.Min(Math.Min(QuotaRemaining(), WindowRemaining()), BedtimeRemaining());
+        }
+
+        // 지금 남은 시간을 정하는 게 취침 시각인가
+        bool BedtimeBinding()
+        {
+            double b = BedtimeRemaining();
+            return b != double.MaxValue && b <= Math.Min(QuotaRemaining(), WindowRemaining());
+        }
+
+        string BedtimeText()
+        {
+            int bed = schedule.BedtimeMinutes[(int)Logical().DayOfWeek];
+            return bed > 0 ? DayHeader.BedClock(config.ResetHour, bed) : null;
         }
 
         // 논리적 시각을 사람이 읽는 시각으로: "22:00", "내일 18:00", "토요일 10:00"
@@ -371,6 +401,7 @@ namespace PlayTimer
 
         string WindowLineShort()
         {
+            if (PastBedtime()) return "잘 시간이 지났어요 (" + BedtimeText() + ").";
             if (focus != null && !focus.Quest.CountsAsPlay) return "집중 중: " + focus.Quest.Title;
             var logical = Logical();
             if (Gated() && GraceRemaining() <= 0) return "일일 퀘스트를 끝내면 자유 시간이 열려요.";
@@ -392,7 +423,10 @@ namespace PlayTimer
         int StageFor(double overSeconds)
         {
             double overMin = overSeconds / 60.0;
-            return overMin >= config.Stage3AfterMinutes ? 3 : overMin >= config.Stage2AfterMinutes ? 2 : 1;
+            int stage = overMin >= config.Stage3AfterMinutes ? 3 : overMin >= config.Stage2AfterMinutes ? 2 : 1;
+            // 잘 시간은 처음부터 강하게(기본: 화면 가운데 창부터) 알린다.
+            if (PastBedtime()) stage = Math.Max(stage, config.BedtimeStartStage);
+            return stage;
         }
 
         public Status GetStatus()
@@ -408,9 +442,17 @@ namespace PlayTimer
             st.DayLabel = string.Format("{0}월 {1}일 ({2})", logical.Month, logical.Day, ScheduleForm.DayNames[(int)logical.DayOfWeek]);
             st.ExtensionsLeft = Math.Max(0, config.MaxExtensionsPerDay - state.ExtensionsUsed);
             st.ExtensionMinutes = config.ExtensionMinutes;
+            st.Bedtime = BedtimeText();
 
             var todo = quests.Todo(Today, TodayDow);
             st.HasTodo = todo.Count > 0;
+            bool bedNow = PastBedtime();
+            if (PastBedtime())
+            {
+                // 잘 시간에는 연장도, 퀘스트로 넘어가는 것도 없다.
+                st.ExtensionsLeft = 0;
+                st.HasTodo = false;
+            }
             int total = quests.DailyFor(TodayDow).Count;
             var questParts = new List<string>();
             if (total > 0) questParts.Add(string.Format("일일 퀘스트 {0}/{1}", quests.DailyDone(Today, TodayDow), total));
@@ -420,7 +462,13 @@ namespace PlayTimer
             st.QuestLine = string.Join(" · ", questParts.ToArray());
             st.InFocus = focus != null;
 
-            if (QuotaRemaining() <= 0)
+            if (bedNow)
+            {
+                st.Tag = "잘 시간";
+                st.Reason = "잘 시간이에요";
+                st.ReasonDetail = "취침 시간 " + BedtimeText() + "이 지났어요. 남은 시간과 상관없이 오늘은 여기까지 하고 쉬어요.";
+            }
+            else if (QuotaRemaining() <= 0)
             {
                 st.Reason = "오늘 사용 시간이 끝났어요";
                 st.ReasonDetail = "오늘 총량 " + Ui.Duration((int)(LimitSeconds() / 60)) + "을 모두 썼어요.";
@@ -479,6 +527,21 @@ namespace PlayTimer
             if ((now - lastSave).TotalSeconds >= 30) history.Save();
             if (historyForm != null && (int)now.TimeOfDay.TotalSeconds % 60 == 0) historyForm.RefreshIfToday();
 
+            // 취침: 미리 한 번 알리고, 시각이 되면 집중 중이어도 끝낸다.
+            double bedLeft = BedtimeRemaining();
+            if (bedLeft != double.MaxValue && !double.IsNaN(prevBedtime) && config.BedtimeWarnMinutes > 0)
+            {
+                double t = config.BedtimeWarnMinutes * 60.0;
+                if (prevBedtime > t && bedLeft <= t && bedLeft > 0)
+                    Toast.Show(config.BedtimeWarnMinutes + "분 뒤에 잘 시간이에요", "취침 시간 " + BedtimeText() + ". 하던 걸 슬슬 마무리하세요.", Ui.Amber);
+            }
+            prevBedtime = bedLeft;
+            if (focus != null && bedLeft <= 0)
+            {
+                StopFocus(false);
+                Toast.Show("잘 시간이라 집중을 마쳤어요", "진행한 시간은 저장했어요. 내일 이어서 해요.", Ui.Blue);
+            }
+
             if (focus != null)
             {
                 bool wasReached = focus.Quest.TargetReached(Today);
@@ -519,7 +582,9 @@ namespace PlayTimer
             }
             if (crossed != int.MaxValue)
             {
-                string body = QuotaRemaining() <= WindowRemaining()
+                string body = BedtimeBinding()
+                    ? "곧 잘 시간이에요(" + BedtimeText() + "). 슬슬 정리하세요."
+                    : QuotaRemaining() <= WindowRemaining()
                     ? "오늘 사용 시간이 곧 끝나요. 슬슬 정리하세요."
                     : "곧 쉬는 시간이에요(" + When(Logical().AddSeconds(after)) + "부터). 슬슬 정리하세요.";
                 Toast.Show(crossed + "분 남았어요", body, crossed <= 1 ? Ui.Red : Ui.Amber);
@@ -578,6 +643,11 @@ namespace PlayTimer
 
         public void RequestExtend(IWin32Window owner)
         {
+            if (PastBedtime())
+            {
+                ConfirmDialog.Info(owner, "잘 시간에는 연장할 수 없어요", "취침 시간 " + BedtimeText() + "이 지났어요. 내일 다시 만나요.");
+                return;
+            }
             int left = Math.Max(0, config.MaxExtensionsPerDay - state.ExtensionsUsed);
             if (left <= 0 || config.ExtensionMinutes <= 0)
             {
@@ -755,6 +825,11 @@ namespace PlayTimer
 
         public void StartFocus(Quest quest)
         {
+            if (PastBedtime())
+            {
+                ConfirmDialog.Info(board, "잘 시간이 지났어요", "취침 시간 " + BedtimeText() + " 이후에는 집중을 시작할 수 없어요. 내일 이어서 해요.");
+                return;
+            }
             if (focus != null) StopFocus(false);
             focus = new FocusSession { Quest = quest };
             CloseNag();

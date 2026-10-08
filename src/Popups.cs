@@ -25,6 +25,7 @@ namespace PlayTimer
         public bool HasTodo;            // 오늘 남은 퀘스트가 있는가
         public bool InFocus;
         public string QuestLine;        // "일일 퀘스트 1/3 · 연속 2일 · Lv 2"
+        public string Bedtime;          // "23:30", 없으면 null
 
         public bool Over { get { return Remaining <= 0; } }
         public double OverSeconds { get { return Math.Max(0, -Remaining); } }
@@ -217,7 +218,7 @@ namespace PlayTimer
                 case NagSize.Medium:
                     header.Text = st.Tag;
                     big.Text = over;
-                    title.Text = "진짜로 이제 그만할 시간이에요";
+                    title.Text = st.Tag == "잘 시간" ? "이제 PC를 끄고 잘 시간이에요" : "진짜로 이제 그만할 시간이에요";
                     break;
                 default:
                     header.Text = st.Tag;
@@ -225,7 +226,7 @@ namespace PlayTimer
                     title.Text = "그만! 오늘은 여기까지";
                     break;
             }
-            detail.Text = size == NagSize.Small ? st.ReasonDetail : st.Reason + ". " + st.ReasonDetail;
+            detail.Text = size == NagSize.Small || st.Tag == "잘 시간" ? st.ReasonDetail : st.Reason + ". " + st.ReasonDetail;
             hint.Text = st.EscalationHint;
 
             extendButton.Visible = st.CanExtend;
@@ -491,7 +492,8 @@ namespace PlayTimer
             remaining.Text = Ui.Clock(Math.Abs(st.Remaining));
             remaining.ForeColor = st.StateColor;
             remainingSuffix.Text = st.Over ? "초과" : "남음";
-            usage.Text = string.Format("오늘 {0} 사용 · 총량 {1}", Ui.Duration((int)(st.UsedSeconds / 60)), Ui.Duration((int)(st.LimitSeconds / 60)));
+            usage.Text = string.Format("오늘 {0} 사용 · 총량 {1}", Ui.Duration((int)(st.UsedSeconds / 60)), Ui.Duration((int)(st.LimitSeconds / 60)))
+                + (st.Bedtime != null ? " · 취침 " + st.Bedtime : "");
             window.Text = st.WindowLine;
             window.ForeColor = st.InWindow ? Ui.Green : Ui.Red;
             extension.Text = st.CanExtend
