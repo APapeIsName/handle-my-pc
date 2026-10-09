@@ -402,6 +402,84 @@ namespace PlayTimer
         }
     }
 
+    // 잠깐 멈춤 화면. 마우스·키보드를 건드리면 닫히며 다시 시작한다.
+    class PauseScreen : Form
+    {
+        readonly TrayApp app;
+        readonly Label elapsed;
+        readonly Timer timer = new Timer();
+
+        public PauseScreen(TrayApp app)
+        {
+            this.app = app;
+            FormBorderStyle = FormBorderStyle.None;
+            ShowInTaskbar = false;
+            TopMost = true;
+            StartPosition = FormStartPosition.Manual;
+            Bounds = Screen.PrimaryScreen.Bounds;
+            BackColor = Color.FromArgb(18, 18, 20);
+            Opacity = 0.9;
+            KeyPreview = true;
+
+            var stack = new FlowLayoutPanel
+            {
+                FlowDirection = FlowDirection.TopDown,
+                WrapContents = false,
+                AutoSize = true,
+                AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                BackColor = Color.Transparent
+            };
+            var title = Ui.Label("잠깐 멈춤", Ui.Font(40f, FontStyle.Bold), Color.White);
+            var sub = Ui.Label("놀이 시간과 집중 시간이 멈춰 있어요", Ui.Font(15f), Ui.DarkText);
+            elapsed = Ui.Label("", Ui.Font(22f, FontStyle.Bold), Ui.BlueLight);
+            var hint = Ui.Label("마우스나 키보드를 움직이면 바로 다시 시작해요", Ui.Font(12f), Ui.DarkSubText);
+            title.Margin = Ui.Pad(0, 0, 0, 10);
+            sub.Margin = Ui.Pad(0, 0, 0, 28);
+            elapsed.Margin = Ui.Pad(0, 0, 0, 28);
+            foreach (var l in new[] { title, sub, elapsed, hint })
+            {
+                l.Anchor = AnchorStyles.None;
+                stack.Controls.Add(l);
+            }
+            Controls.Add(stack);
+
+            Action center = delegate
+            {
+                var pref = stack.GetPreferredSize(Size.Empty);
+                stack.Location = new Point((ClientSize.Width - pref.Width) / 2, (ClientSize.Height - pref.Height) / 2);
+            };
+            Shown += delegate { center(); };
+
+            // 화면 위에서의 입력도 바로 받는다(멈춘 직후 잠깐은 무시).
+            MouseMove += delegate { Wake(); };
+            MouseDown += delegate { Wake(); };
+            KeyDown += delegate { Wake(); };
+            foreach (Control c in stack.Controls) { c.MouseMove += delegate { Wake(); }; c.MouseDown += delegate { Wake(); }; }
+            stack.MouseMove += delegate { Wake(); };
+
+            timer.Interval = 1000;
+            timer.Tick += delegate { Tick(); center(); };
+            timer.Start();
+            Tick();
+        }
+
+        void Wake()
+        {
+            if (app.PausedSeconds > 3) app.EndPause();
+        }
+
+        void Tick()
+        {
+            elapsed.Text = "멈춘 시간 " + Ui.Clock(app.PausedSeconds);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) timer.Dispose();
+            base.Dispose(disposing);
+        }
+    }
+
     // 트레이 아이콘을 클릭하면 뜨는 오늘 현황 카드.
     class StatusFlyout : CardForm
     {
@@ -459,10 +537,23 @@ namespace PlayTimer
                 Margin = Ui.Pad(0, 0, 0, 16)
             };
             historyLink.LinkClicked += delegate { Close(); app.OpenHistory(); };
+            historyLink.Margin = Ui.Pad(0, 0, 0, 4);
+            var pauseLink = new LinkLabel
+            {
+                Text = "자리 비울 때: 잠깐 멈추기",
+                AutoSize = true,
+                Font = Ui.Font(9.5f),
+                LinkColor = Ui.Blue,
+                ActiveLinkColor = Ui.Blue,
+                LinkBehavior = LinkBehavior.HoverUnderline,
+                BackColor = Color.Transparent,
+                Margin = Ui.Pad(0, 0, 0, 16)
+            };
+            pauseLink.LinkClicked += delegate { Close(); app.StartPause(); };
             LinkLabel updateLink = null;
             if (Updater.IsNewer(app.LatestUpdate))
             {
-                historyLink.Margin = Ui.Pad(0, 0, 0, 4);
+                pauseLink.Margin = Ui.Pad(0, 0, 0, 4);
                 updateLink = new LinkLabel
                 {
                     Text = "새 버전 " + Updater.Text(app.LatestUpdate.Version) + "이 나왔어요 →",
@@ -490,7 +581,7 @@ namespace PlayTimer
             row.Controls.Add(extendButton);
             row.Margin = Ui.Pad(-4, 0, 0, 0);
 
-            foreach (Control c in new Control[] { day, remainRow, bar, usage, window, extension, questLine, historyLink, updateLink, row })
+            foreach (Control c in new Control[] { day, remainRow, bar, usage, window, extension, questLine, historyLink, pauseLink, updateLink, row })
                 if (c != null) stack.Controls.Add(c);
             Controls.Add(stack);
 

@@ -199,7 +199,10 @@ namespace PlayTimer
         readonly NotifyIcon tray;
         readonly System.Windows.Forms.Timer tick;
         readonly ToolStripLabel menuHeader, menuSub;
-        readonly ToolStripMenuItem extendItem, stopFocusItem;
+        readonly ToolStripMenuItem extendItem, stopFocusItem, pauseItem;
+        bool paused;
+        DateTime pauseStartUtc;
+        PauseScreen pauseScreen;
         readonly EventWaitHandle showEvent;
         readonly SynchronizationContext ui;
 
@@ -247,6 +250,7 @@ namespace PlayTimer
             menuSub = new ToolStripLabel { ForeColor = Ui.SubText, Margin = Ui.Pad(4, 0, 4, 6) };
             extendItem = new ToolStripMenuItem("", null, delegate { RequestExtend(null); });
             stopFocusItem = new ToolStripMenuItem("집중 그만하기", null, delegate { StopFocus(true); });
+            pauseItem = new ToolStripMenuItem("잠깐 멈추기 (자리 비울 때)", null, delegate { StartPause(); });
             updateItem = new ToolStripMenuItem("", null, delegate { OpenAbout(); }) { Font = Ui.Font(9.5f, FontStyle.Bold), ForeColor = Ui.Green, Visible = false };
             var menu = new ContextMenuStrip { Font = Ui.Font(9.5f), ShowImageMargin = false };
             menu.Items.Add(menuHeader);
@@ -254,6 +258,7 @@ namespace PlayTimer
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(new ToolStripMenuItem("오늘의 퀘스트...", null, delegate { OpenQuests(false); }) { Font = Ui.Font(9.5f, FontStyle.Bold) });
             menu.Items.Add(stopFocusItem);
+            menu.Items.Add(pauseItem);
             menu.Items.Add(new ToolStripMenuItem("사용 기록...", null, delegate { OpenHistory(); }));
             menu.Items.Add(new ToolStripMenuItem("시간 설정...", null, delegate { OpenSchedule(); }));
             menu.Items.Add(extendItem);
@@ -274,6 +279,7 @@ namespace PlayTimer
             ThreadPool.RegisterWaitForSingleObject(showEvent, delegate { ui.Post(delegate { OpenQuests(false); }, null); }, null, -1, false);
 
             SystemEvents.SessionSwitch += OnSessionSwitch;
+            SystemEvents.PowerModeChanged += OnPowerModeChanged;
 
             tick = new System.Windows.Forms.Timer { Interval = 1000 };
             tick.Tick += delegate { OnTick(); };
@@ -323,9 +329,36 @@ namespace PlayTimer
         void OnSessionSwitch(object sender, SessionSwitchEventArgs e)
         {
             if (e.Reason == SessionSwitchReason.SessionLock || e.Reason == SessionSwitchReason.ConsoleDisconnect || e.Reason == SessionSwitchReason.RemoteDisconnect)
+            {
                 locked = true;
+                // 잠근 동안 경고창이 화면에 남아 있지 않게 닫는다.
+                ui.Post(delegate { CloseNag(); }, null);
+            }
             else if (e.Reason == SessionSwitchReason.SessionUnlock || e.Reason == SessionSwitchReason.ConsoleConnect || e.Reason == SessionSwitchReason.RemoteConnect)
+            {
                 locked = false;
+                ui.Post(delegate { lastNagClosed = DateTime.UtcNow; }, null);
+            }
+        }
+
+        // 절전에 들어가기 전에 경고창을 닫고 저장한다. 깨어나면 바로 띄우지 않고, 아직 초과면 정해진 간격 뒤에 다시 띄운다.
+        void OnPowerModeChanged(object sender, PowerModeChangedEventArgs e)
+        {
+            if (e.Mode == PowerModes.Suspend)
+                ui.Send(delegate
+                {
+                    CloseNag();
+                    SaveState();
+                    SaveQuests();
+                    history.Save();
+                }, null);
+            else if (e.Mode == PowerModes.Resume)
+                ui.Post(delegate
+                {
+                    lastTick = DateTime.UtcNow;
+                    lastNagClosed = DateTime.UtcNow;
+                    prevRemaining = double.NaN;
+                }, null);
         }
 
         // ── 시간 계산 ─────────────────────────────────────────────
@@ -560,6 +593,20 @@ namespace PlayTimer
             }
             if (locked) return;
 
+            if (paused)
+            {
+                // 잠깐 멈춤: 시간을 쓰지 않고 알림도 띄우지 않는다. 기록에는 자리 비움으로 남긴다.
+                try { history.Record(Today, DateTime.Now, delta, UsageKind.Idle, "", "", 0); } catch { }
+                if ((now - lastSave).TotalSeconds >= 30)
+                {
+                    SaveState();
+                    history.Save();
+                    lastSave = now;
+                }
+                UpdateTray();
+                return;
+            }
+
             RecordUsage(delta);
             if ((now - lastSave).TotalSeconds >= 30) history.Save();
             if (historyForm != null && (int)now.TimeOfDay.TotalSeconds % 60 == 0) historyForm.RefreshIfToday();
@@ -606,16 +653,21 @@ namespace PlayTimer
             if ((schedule.IsAllowed(Logical()) && !Gated()) || GraceRemaining() > 0) outsideSeconds = 0;
             else outsideSeconds += delta;
 
-            double before = double.IsNaN(prevRemaining) ? double.MaxValue : prevRemaining;
+            // 직전 값이 없으면(시작·절전 해제·멈춤 해제 직후) 경계를 "방금 지났다"고 보지 않는다.
+            bool hasBefore = !double.IsNaN(prevRemaining);
+            double before = hasBefore ? prevRemaining : double.MaxValue;
             double after = RemainingSeconds();
             prevRemaining = after;
+
+            // 하루가 바뀌었거나 연장·설정 변경으로 더 이상 초과가 아니면 열린 경고창을 닫는다.
+            if (activeNag != null && after > 0) CloseNag();
 
             // 여러 경고 지점을 한꺼번에 지나면 가장 급한 것 하나만 보여 준다.
             int crossed = int.MaxValue;
             foreach (int w in config.WarnAtMinutes)
             {
                 double t = w * 60.0;
-                if (before > t && after <= t && after > 0) crossed = Math.Min(crossed, w);
+                if (hasBefore && before > t && after <= t && after > 0) crossed = Math.Min(crossed, w);
             }
             if (crossed != int.MaxValue)
             {
@@ -626,7 +678,7 @@ namespace PlayTimer
                     : "곧 쉬는 시간이에요(" + When(Logical().AddSeconds(after)) + "부터). 슬슬 정리하세요.";
                 Toast.Show(crossed + "분 남았어요", body, crossed <= 1 ? Ui.Red : Ui.Amber);
             }
-            if (before > 0 && after <= 0)
+            if (hasBefore && before > 0 && after <= 0)
                 lastNagClosed = DateTime.MinValue;
 
             if (after <= 0) MaybeNag(-after);
@@ -1019,8 +1071,53 @@ namespace PlayTimer
         }
 
         // 집중 중에 허용되지 않은 앱이 맨 앞에 오면, 잠깐 경고한 뒤 최소화한다.
+        // ── 잠깐 멈추기 ──────────────────────────────────────────
+
+        public bool Paused { get { return paused; } }
+        public double PausedSeconds { get { return paused ? (DateTime.UtcNow - pauseStartUtc).TotalSeconds : 0; } }
+
+        // 누른 직후 이 시간(초) 동안의 입력은 손을 떼는 동작으로 보고 무시한다.
+        const double PauseGrace = 3;
+
+        public void StartPause()
+        {
+            if (paused) return;
+            paused = true;
+            pauseStartUtc = DateTime.UtcNow;
+            CloseNag();
+            if (flyout != null) flyout.Close();
+            if (hud != null) hud.Hide();
+            pauseScreen = new PauseScreen(this);
+            pauseScreen.Show();
+            pauseScreen.Activate();
+            UpdateTray();
+        }
+
+        public void EndPause()
+        {
+            if (!paused) return;
+            double seconds = PausedSeconds;
+            paused = false;
+            if (pauseScreen != null) { pauseScreen.Close(); pauseScreen = null; }
+            if (hud != null) hud.Show();
+            lastTick = DateTime.UtcNow;
+            prevRemaining = double.NaN;
+            Toast.Show("다시 시작했어요", (seconds < 60 ? "1분 안 되게" : Ui.Duration((int)(seconds / 60))) + " 멈췄어요. 남은 시간 " + Ui.Clock(Math.Max(0, RemainingSeconds())), Ui.Blue);
+            UpdateTray();
+        }
+
+        // 멈춘 뒤 마우스·키보드 입력이 있으면 다시 시작한다.
+        public void CheckPauseInput()
+        {
+            if (!paused) return;
+            double since = PausedSeconds;
+            if (since <= PauseGrace) return;
+            if (UsageHistory.IdleSeconds() + 0.5 < since - PauseGrace) EndPause();
+        }
+
         void GuardApps()
         {
+            if (paused) { CheckPauseInput(); return; }
             if (focus == null || focus.Quest.Apps.Count == 0 || locked || hud == null) { badWindow = IntPtr.Zero; return; }
             string name;
             IntPtr h = AppGuard.Foreground(out name);
@@ -1090,6 +1187,7 @@ namespace PlayTimer
             tick.Stop();
             guard.Stop();
             SystemEvents.SessionSwitch -= OnSessionSwitch;
+            SystemEvents.PowerModeChanged -= OnPowerModeChanged;
             SaveState();
             SaveQuests();
             history.Save();
@@ -1098,6 +1196,7 @@ namespace PlayTimer
             if (historyForm != null) historyForm.Close();
             if (hud != null) hud.Close();
             if (board != null) board.Close();
+            if (pauseScreen != null) pauseScreen.Close();
             CloseNag();
             foreach (var f in new Form[] { flyout, scheduleForm, shutdownNotice })
                 if (f != null) f.Close();
@@ -1131,6 +1230,7 @@ namespace PlayTimer
             extendItem.Text = string.Format("{0}분 연장 ({1}회 남음)", config.ExtensionMinutes, left);
             extendItem.Enabled = left > 0 && config.ExtensionMinutes > 0;
             stopFocusItem.Visible = focus != null;
+            pauseItem.Enabled = !paused;
             if (focus != null)
             {
                 menuHeader.Text = "집중 중 " + Ui.Clock(focus.Elapsed);
@@ -1159,6 +1259,12 @@ namespace PlayTimer
                 text = m >= 100 ? (m / 60) + "h" : m.ToString();
                 bg = Ui.Green;
                 tip = "PlayTimer · 집중: " + focus.Quest.Title;
+            }
+            if (paused)
+            {
+                text = "II";
+                bg = Color.FromArgb(128, 134, 139);
+                tip = "PlayTimer · 잠깐 멈춤";
             }
             tray.Text = tip.Length > 63 ? tip.Substring(0, 63) : tip;
             string key = text + bg.ToArgb();
