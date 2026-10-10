@@ -402,26 +402,22 @@ namespace PlayTimer
         }
     }
 
-    // 잠깐 멈춤 화면. 마우스·키보드를 건드리면 닫히며 다시 시작한다.
+    // 잠깐 멈춤 화면. 보호화면처럼 모든 모니터를 덮고, "다시 시작" 버튼을 눌러야만 풀린다.
+    // (마우스·키보드 움직임으로는 풀리지 않는다)
     class PauseScreen : Form
     {
         readonly TrayApp app;
         readonly Label elapsed;
+        readonly FlowLayoutPanel stack;
+        readonly List<Form> covers = new List<Form>();
         readonly Timer timer = new Timer();
 
         public PauseScreen(TrayApp app)
         {
             this.app = app;
-            FormBorderStyle = FormBorderStyle.None;
-            ShowInTaskbar = false;
-            TopMost = true;
-            StartPosition = FormStartPosition.Manual;
-            Bounds = Screen.PrimaryScreen.Bounds;
-            BackColor = Color.FromArgb(18, 18, 20);
-            Opacity = 0.9;
-            KeyPreview = true;
+            ConfigureCover(this, Screen.PrimaryScreen);
 
-            var stack = new FlowLayoutPanel
+            stack = new FlowLayoutPanel
             {
                 FlowDirection = FlowDirection.TopDown,
                 WrapContents = false,
@@ -431,46 +427,69 @@ namespace PlayTimer
             };
             var title = Ui.Label("잠깐 멈춤", Ui.Font(40f, FontStyle.Bold), Color.White);
             var sub = Ui.Label("놀이 시간과 집중 시간이 멈춰 있어요", Ui.Font(15f), Ui.DarkText);
-            elapsed = Ui.Label("", Ui.Font(22f, FontStyle.Bold), Ui.BlueLight);
-            var hint = Ui.Label("마우스나 키보드를 움직이면 바로 다시 시작해요", Ui.Font(12f), Ui.DarkSubText);
-            title.Margin = Ui.Pad(0, 0, 0, 10);
-            sub.Margin = Ui.Pad(0, 0, 0, 28);
-            elapsed.Margin = Ui.Pad(0, 0, 0, 28);
-            foreach (var l in new[] { title, sub, elapsed, hint })
+            elapsed = Ui.Label("멈춘 시간 0:00:00", Ui.Font(22f, FontStyle.Bold), Ui.BlueLight);
+            elapsed.AutoSize = false;
+            elapsed.TextAlign = ContentAlignment.MiddleCenter;
+            elapsed.Size = new Size(Ui.S(420), Ui.S(44));
+            var resume = new UiButton("다시 시작", ButtonKind.Primary, true)
             {
-                l.Anchor = AnchorStyles.None;
-                stack.Controls.Add(l);
+                Font = Ui.Font(14f, FontStyle.Bold),
+                TabStop = false
+            };
+            resume.FitToText();
+            resume.Size = new Size(Math.Max(resume.Width, Ui.S(200)), Ui.S(56));
+            resume.Click += delegate { app.EndPause(); };
+            var hint = Ui.Label("돌아오면 버튼을 눌러 주세요. 그 전까지는 시간이 흐르지 않아요.", Ui.Font(11f), Ui.DarkSubText);
+            title.Margin = Ui.Pad(0, 0, 0, 10);
+            sub.Margin = Ui.Pad(0, 0, 0, 24);
+            elapsed.Margin = Ui.Pad(0, 0, 0, 32);
+            resume.Margin = Ui.Pad(0, 0, 0, 18);
+            foreach (Control c in new Control[] { title, sub, elapsed, resume, hint })
+            {
+                c.Anchor = AnchorStyles.None;
+                stack.Controls.Add(c);
             }
             Controls.Add(stack);
 
-            Action center = delegate
+            // 글자가 바뀌어도 위치는 그대로 둔다(움직이면 커서 밑에서 불필요한 마우스 이벤트가 생긴다).
+            Shown += delegate
             {
                 var pref = stack.GetPreferredSize(Size.Empty);
                 stack.Location = new Point((ClientSize.Width - pref.Width) / 2, (ClientSize.Height - pref.Height) / 2);
+                foreach (var c in covers) c.Show();
             };
-            Shown += delegate { center(); };
 
-            // 화면 위에서의 입력도 바로 받는다(멈춘 직후 잠깐은 무시).
-            MouseMove += delegate { Wake(); };
-            MouseDown += delegate { Wake(); };
-            KeyDown += delegate { Wake(); };
-            foreach (Control c in stack.Controls) { c.MouseMove += delegate { Wake(); }; c.MouseDown += delegate { Wake(); }; }
-            stack.MouseMove += delegate { Wake(); };
+            foreach (var screen in Screen.AllScreens)
+            {
+                if (screen.Primary) continue;
+                var cover = new Form();
+                ConfigureCover(cover, screen);
+                cover.FormClosing += delegate(object s, FormClosingEventArgs e) { if (e.CloseReason == CloseReason.UserClosing && app.Paused) e.Cancel = true; };
+                covers.Add(cover);
+            }
+            FormClosed += delegate { foreach (var c in covers) { c.Hide(); c.Dispose(); } };
 
             timer.Interval = 1000;
-            timer.Tick += delegate { Tick(); center(); };
+            timer.Tick += delegate { elapsed.Text = "멈춘 시간 " + Ui.Clock(app.PausedSeconds); };
             timer.Start();
-            Tick();
         }
 
-        void Wake()
+        static void ConfigureCover(Form f, Screen screen)
         {
-            if (app.PausedSeconds > 3) app.EndPause();
+            f.FormBorderStyle = FormBorderStyle.None;
+            f.ShowInTaskbar = false;
+            f.TopMost = true;
+            f.StartPosition = FormStartPosition.Manual;
+            f.Bounds = screen.Bounds;
+            f.BackColor = Color.FromArgb(18, 18, 20);
+            f.Opacity = 0.94;
         }
 
-        void Tick()
+        // Alt+F4 등으로는 닫히지 않는다. 버튼(또는 앱)이 풀어야 닫힌다.
+        protected override void OnFormClosing(FormClosingEventArgs e)
         {
-            elapsed.Text = "멈춘 시간 " + Ui.Clock(app.PausedSeconds);
+            if (e.CloseReason == CloseReason.UserClosing && app.Paused) e.Cancel = true;
+            base.OnFormClosing(e);
         }
 
         protected override void Dispose(bool disposing)

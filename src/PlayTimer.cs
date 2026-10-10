@@ -1076,9 +1076,6 @@ namespace PlayTimer
         public bool Paused { get { return paused; } }
         public double PausedSeconds { get { return paused ? (DateTime.UtcNow - pauseStartUtc).TotalSeconds : 0; } }
 
-        // 누른 직후 이 시간(초) 동안의 입력은 손을 떼는 동작으로 보고 무시한다.
-        const double PauseGrace = 3;
-
         public void StartPause()
         {
             if (paused) return;
@@ -1106,18 +1103,9 @@ namespace PlayTimer
             UpdateTray();
         }
 
-        // 멈춘 뒤 마우스·키보드 입력이 있으면 다시 시작한다.
-        public void CheckPauseInput()
-        {
-            if (!paused) return;
-            double since = PausedSeconds;
-            if (since <= PauseGrace) return;
-            if (UsageHistory.IdleSeconds() + 0.5 < since - PauseGrace) EndPause();
-        }
-
         void GuardApps()
         {
-            if (paused) { CheckPauseInput(); return; }
+            if (paused) return;
             if (focus == null || focus.Quest.Apps.Count == 0 || locked || hud == null) { badWindow = IntPtr.Zero; return; }
             string name;
             IntPtr h = AppGuard.Foreground(out name);
@@ -1196,6 +1184,7 @@ namespace PlayTimer
             if (historyForm != null) historyForm.Close();
             if (hud != null) hud.Close();
             if (board != null) board.Close();
+            paused = false;
             if (pauseScreen != null) pauseScreen.Close();
             CloseNag();
             foreach (var f in new Form[] { flyout, scheduleForm, shutdownNotice })
